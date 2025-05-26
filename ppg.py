@@ -10,7 +10,8 @@ st.title("📷 PPG 기반 실시간 심박수 측정 (Streamlit 데모)")
 
 roi_radius = 50
 
-uploaded_video = st.camera_input("👉 카메라로 짧은 영상 촬영 후 업로드 (플래시 켜주세요)")
+#uploaded_video = st.camera_input("👉 카메라로 짧은 영상 촬영 후 업로드 (플래시 켜주세요)")
+uploaded_video = st.file_uploader("📹 라이트 켜고 손가락을 비춘 영상을 업로드하세요", type=["mp4"])
 
 if uploaded_video is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
