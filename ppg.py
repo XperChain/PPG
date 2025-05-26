@@ -46,8 +46,8 @@ if uploaded_video is not None:
     cap.release()
 
     # ✅ 신호 전처리: smoothing + filtering
-    smoothed = moving_average(brightness_data_g, window_size=5)
-    filtered = bandpass_filter(smoothed, fs=fps)
+    # smoothed = moving_average(brightness_data_g, window_size=5)
+    filtered = bandpass_filter(brightness_data_g, fs=fps)
 
     # ⛰️ 피크 감지
     min_distance = int(fps * 0.5)
@@ -63,7 +63,7 @@ if uploaded_video is not None:
 
     # 📈 시각화
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(brightness_data_g, color='gray', alpha=0.3, label='Raw Green')
+    #ax.plot(brightness_data_g, color='gray', alpha=0.3, label='Raw Green')
     ax.plot(filtered, color='green', label='Filtered Signal')
     ax.plot(peaks, [filtered[i] for i in peaks], 'ro', label='R-Peaks')
     ax.set_title("Green Channel Brightness with Filtering & Peak Detection")
