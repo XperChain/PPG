@@ -1,23 +1,33 @@
-# streamlit_app.py
 import streamlit as st
 import cv2
 import numpy as np
-from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
+from scipy.signal import find_peaks, butter, filtfilt
 import tempfile
 
 st.title("📷 PPG 기반 실시간 심박수 측정 (Streamlit 데모)")
-
 roi_radius = 50
 
-#uploaded_video = st.camera_input("👉 카메라로 짧은 영상 촬영 후 업로드 (플래시 켜주세요)")
+# 📁 사용자 영상 업로드
 uploaded_video = st.file_uploader("📹 라이트 켜고 손가락을 비춘 영상을 업로드하세요", type=["mp4"])
+
+# 🔧 신호 처리 함수
+def moving_average(signal, window_size=5):
+    return np.convolve(signal, np.ones(window_size)/window_size, mode='same')
+
+def bandpass_filter(data, fs, lowcut=0.75, highcut=3.0, order=4):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
 
 if uploaded_video is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
         tfile.write(uploaded_video.getvalue())
         video_path = tfile.name
 
+    # 🎥 영상 처리
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     brightness_data_g = []
@@ -35,22 +45,30 @@ if uploaded_video is not None:
         brightness_data_g.append(mean_g)
     cap.release()
 
-    # peak detection
+    # ✅ 신호 전처리: smoothing + filtering
+    smoothed = moving_average(brightness_data_g, window_size=5)
+    filtered = bandpass_filter(smoothed, fs=fps)
+
+    # ⛰️ 피크 감지
     min_distance = int(fps * 0.5)
-    peaks, _ = find_peaks(brightness_data_g, distance=min_distance, prominence=1.5)
-    duration_seconds = len(brightness_data_g) / fps
+    peaks, _ = find_peaks(filtered, distance=min_distance, prominence=1.5)
+
+    # 💓 심박수 계산
+    duration_seconds = len(filtered) / fps
     bpm = len(peaks) * 60 / duration_seconds
 
-    # 결과 출력
+    # 📊 결과 출력
     st.markdown(f"### 💓 추정 심박수: `{bpm:.1f} bpm`")
-    st.markdown(f"총 프레임 수: {len(brightness_data_g)}, 피크 개수: {len(peaks)}")
+    st.markdown(f"총 프레임 수: {len(brightness_data_g)}, 감지된 피크 수: {len(peaks)}")
 
-    # 시각화
+    # 📈 시각화
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(brightness_data_g, color='green', label='Green Brightness')
-    ax.plot(peaks, [brightness_data_g[i] for i in peaks], 'ro', label='Peaks')
-    ax.set_title("Green Channel Brightness & R-Peaks")
-    ax.set_ylabel("Brightness (0–255)")
+    ax.plot(brightness_data_g, color='gray', alpha=0.3, label='Raw Green')
+    ax.plot(filtered, color='green', label='Filtered Signal')
+    ax.plot(peaks, [filtered[i] for i in peaks], 'ro', label='R-Peaks')
+    ax.set_title("Green Channel Brightness with Filtering & Peak Detection")
+    ax.set_ylabel("Brightness")
+    ax.set_xlabel("Frame Index")
     ax.grid(True)
     ax.legend()
     st.pyplot(fig)
