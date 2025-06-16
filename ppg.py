@@ -84,3 +84,15 @@ if uploaded_video is not None:
     ax.grid(True)
     ax.legend()
     st.pyplot(fig)
+
+    # 📈 R-Peaks 값만 꺾은선 그래프로 시각화
+    fig3, ax3 = plt.subplots(figsize=(10, 4))
+    peak_indices = peaks
+    peak_values = [filtered[i] for i in peak_indices]
+    ax3.plot(peak_indices, peak_values, marker='o', linestyle='-', color='red', label='R-Peak Amplitudes')
+    ax3.set_title("R-Peak Amplitudes over Time")
+    ax3.set_xlabel("Frame Index")
+    ax3.set_ylabel("Amplitude")
+    ax3.grid(True)
+    ax3.legend()
+    st.pyplot(fig3)
