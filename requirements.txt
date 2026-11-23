@@ -1,4 +1,9 @@
 opencv-python-headless
 numpy
-matplotlib
 scipy
+pandas
+matplotlib
+requests
+cryptography
+python-dotenv
+
