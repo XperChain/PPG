@@ -54,7 +54,7 @@ def config(name: str, default: str = '') -> str:
     return os.environ.get(name, default).strip()
 
 
-CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'Ced62f5ada9c3bb783ce71a05db811a937d9a8f19')
+CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'C18d506f6752969058498d092c4e2fb3638297c22')
 NODE_URL = config('XPER_NODE_URL', 'http://ai-labs.duckdns.org:5000').rstrip('/')
 SCHEMA = 'heart_rate_v1'
 ACCEPTED_SCHEMAS = (SCHEMA,)
