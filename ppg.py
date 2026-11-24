@@ -82,7 +82,7 @@ def config(name: str, default: str = '') -> str:
     return os.environ.get(name, default).strip()
 
 
-CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'Ced62f5ada9c3bb783ce71a05db811a937d9a8f19')
+CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'C6bb38683e3de5bb415578b82ad9cd10169eb0896')
 NODE_URL = config('XPER_NODE_URL', 'http://ai-labs.duckdns.org:5000').rstrip('/')
 SCHEMA = 'prb3'
 TITLE = 'PPG'
