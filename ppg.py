@@ -96,6 +96,11 @@ STIM_MS = 500                      # 숫자 제시 시간
 DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (블록당 기록 구간 = 10 × 2.5초 = 25초)
 BREAK_S = 5                        # 블록 시작 전 안내 + 카운트다운
 
+# 화면 상단 메뉴 아이콘/이름. 아이콘은 이모지 또는 Streamlit 머티리얼 아이콘(:material/이름:)
+#   다른 후보: ':material/ecg_heart:', ':material/cardiology:', '🫀', '💓'
+MEASURE_ICON, MEASURE_NAME = ':material/monitor_heart:', '심박 측정'
+CHAIN_ICON, CHAIN_NAME = '⛓️', '블록체인 보기'
+
 FS = 30.0
 GAP_MS = 400.0
 LIVE_WINDOW_MS = 60_000
@@ -825,7 +830,7 @@ def _at_utc(value) -> str:
 def _safe_cell(v):
     """엑셀(XML)에 쓸 수 없는 제어 문자 제거. 수식 방지는 excel_bytes에서 셀 형식으로 처리."""
     if isinstance(v, str):
-        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE   # openpyxl 없으면 ImportError → CSV로 대체
         return ILLEGAL_CHARACTERS_RE.sub('', v)
     return v
 
@@ -913,7 +918,18 @@ def _add_block(blocks, beats, item, schema, mid, pid, cond, order, t, trial_ms, 
                       'beat': k, 'ibi_ms': v, 'valid': ok})
 
 
+def rows_csv(rows: list[dict]) -> bytes:
+    """엑셀 대신 쓰는 CSV. 체인의 문자열은 신뢰할 수 없으므로 수식으로 해석될 셀은 ' 를 붙인다."""
+    if not rows:
+        return csv_bytes(['(없음)'], [])
+    header = list(rows[0])
+    def cell(v):
+        return "'" + v if isinstance(v, str) and v[:1] in ('=', '+', '-', '@', '\t', '\r') else v
+    return csv_bytes(header, ([cell(r.get(k)) for k in header] for r in rows))
+
+
 def excel_bytes(parsed: dict) -> bytes:
+    import openpyxl  # noqa: F401  (없으면 ImportError → 화면에서 CSV로 대체)
     import pandas as pd
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as xw:
@@ -1399,7 +1415,7 @@ def _load_chain(version: str, nonce: int):
 
 
 def chain_page():
-    st.markdown("### ⛓️ 블록체인 기록")
+    st.markdown(f"### {CHAIN_ICON} 블록체인 기록")
     st.caption(f"컨트랙트 `{CONTRACT_ADDR}` · 노드 `{NODE_URL}`")
     if st.button("🔄 새로 불러오기"):
         st.session_state['chain_nonce'] = st.session_state.get('chain_nonce', 0) + 1
@@ -1416,9 +1432,23 @@ def chain_page():
     m[1].metric("PPG 측정", len({(b['measurement_id'], b['participant_id']) for b in blocks}))
     m[2].metric("참가자", len({b['participant_id'] for b in blocks}))
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
-    st.download_button("📥 엑셀로 내려받기 (.xlsx)", excel_bytes(parsed), f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
-    st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문)")
+    try:
+        xlsx = excel_bytes(parsed)
+    except ImportError:
+        xlsx = None
+    if xlsx is not None:
+        st.download_button("📥 엑셀로 내려받기 (.xlsx)", xlsx, f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+        st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문)")
+    else:
+        # openpyxl이 없으면(requirements.txt 누락) 같은 내용을 CSV 3개로 제공
+        st.warning("서버에 openpyxl이 설치되지 않아 엑셀 파일을 만들 수 없습니다. "
+                   "requirements.txt에 openpyxl을 추가하세요. 우선 같은 내용을 CSV로 내려받을 수 있습니다.")
+        c1, c2, c3 = st.columns(3)
+        for col, (label, rows, name) in zip((c1, c2, c3), (("PPG 요약 CSV", blocks, 'ppg_summary'),
+                                                          ("PPG IBI CSV", beats, 'ppg_ibi'),
+                                                          ("전체 기록 CSV", raw, 'all_records'))):
+            col.download_button(label, rows_csv(rows), f"blockchain_{name}_{stamp}.csv", "text/csv")
 
     st.subheader("PPG 측정 (블록별)")
     if blocks:
@@ -1443,7 +1473,7 @@ def chain_page():
 
 
 def phone_page():
-    st.markdown("### 📷 PPG 측정 (휴식 / 1-back)")
+    st.markdown(f"### {MEASURE_ICON} {MEASURE_NAME} (휴식 / 1-back)")
     pid_raw = st.text_input("참가자 코드", placeholder="P01", max_chars=4)
     with st.expander("설정"):
         trial_s = st.number_input("숫자 간격 (초)", 1.0, 4.0, DEFAULT_TRIAL_MS / 1000, 0.5,
@@ -1626,9 +1656,10 @@ def main():
     if is_monitor:
         monitor_page()
         return
-    view = st.radio("화면", ["📷 측정", "⛓️ 블록체인 보기"], horizontal=True, label_visibility="collapsed",
+    views = [f"{MEASURE_ICON} {MEASURE_NAME}", f"{CHAIN_ICON} {CHAIN_NAME}"]
+    view = st.radio("화면", views, horizontal=True, label_visibility="collapsed",
                     help="측정 중에 [블록체인 보기]로 바꾸면 진행 중인 측정이 중단됩니다.")
-    if view.endswith("블록체인 보기"):
+    if view == views[1]:
         chain_page()
     else:
         phone_page()
