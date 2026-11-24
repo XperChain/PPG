@@ -15,15 +15,18 @@
                   휴식 블록: 화면의 + 를 바라보며 가만히 있기 (응답 없음)
                   1-back 블록: 숫자가 바로 앞 숫자와 같으면 [일치]
                   블록 사이에 안내 + 5초 카운트다운
-  3) [블록체인 저장]  두 블록의 IBI 데이터 + 1-back 결과를 XperChain LogBook에 기록
-                  (노드의 526바이트 제한 때문에 블록마다 필요하면 여러 트랜잭션으로 나눠 저장)
+  3) [블록체인 저장]  두 블록의 IBI + 1-back 결과를 트랜잭션 1개로 XperChain LogBook에 기록
+  상단 [블록체인 보기]  컨트랙트의 모든 기록을 표로 보여 주고 엑셀(.xlsx)로 내려받기
 
-블록체인 기록 형식 (schema = ppg_rest_1back_v1, 키를 짧게 써서 용량 절약)
-  mid  측정 ID       pid  참가자 코드      c  블록 조건 (rest | 1back)     o  진행 순서 (1 | 2)
-  p/n  블록 안 조각 번호/조각 수
-  t    기록 구간 시작 시각(UTC)   hr/sdnn/rmssd  기록 구간 요약   b0  기록 시작~첫 박동(ms)  (블록 첫 조각에만)
-  nb   1-back [적중, 놓침, 오경보, 정기각, 적중 평균 RT(ms), 숫자 간격(ms)]   (1back 블록 첫 조각에만)
-  ibi  IBI(ms) 목록. 음수는 이상치로 제외된 박동 (예: -1520)
+블록체인 기록 형식 (schema = prb3, 노드의 526바이트 제한 안에 두 블록을 담도록 압축)
+  {"schema":"prb3","mid":측정ID,"pid":"P01","ms":숫자간격 ms,"o":"rb"(진행 순서: r=휴식, b=1-back),
+   "t":첫 블록 기록 시작 UTC,
+   "r":{"d":t부터 이 블록 기록 시작까지 ms(첫 블록은 생략),"b0":기록 시작~첫 박동 ms,"ibi":압축 IBI,"x":[제외 박동 번호]},
+   "b":{ ...휴식과 같음..., "nb":[적중,놓침,오경보,정기각,적중 평균 RT ms]}}
+  ibi 압축: 정수 ms IBI를 첫 값은 varint(ibi), 다음부터 varint(zigzag(차이))로 바이트열을 만든 뒤
+            Base85(Python base64.b85encode). 앱의 decode_ibis()로 풀 수 있고,
+            [블록체인 보기] 엑셀에는 풀린 값이 들어갑니다. x는 이상치로 제외된 박동의 0부터 센 번호.
+  심박/SDNN/RMSSD는 IBI에서 다시 계산할 수 있어 저장하지 않습니다.
 
 설정 (.streamlit/secrets.toml 또는 환경변수)
   RATING_WALLET_PRIVATE_KEY_HEX = "..."     # 블록체인 저장 시 필요 (수수료 지갑)
@@ -49,7 +52,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import NormalDist
 
@@ -78,8 +81,10 @@ def config(name: str, default: str = '') -> str:
 
 CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'Ced62f5ada9c3bb783ce71a05db811a937d9a8f19')
 NODE_URL = config('XPER_NODE_URL', 'http://ai-labs.duckdns.org:5000').rstrip('/')
-SCHEMA = 'ppg_rest_1back_v1'
-TITLE = 'PPG Rest/1-back'
+SCHEMA = 'prb3'
+TITLE = 'PPG'
+COND_KEY = {'rest': 'r', '1back': 'b'}       # 기록 안에서 쓰는 짧은 블록 키
+KEY_COND = {v: k for k, v in COND_KEY.items()}
 CONDITIONS = ('rest', '1back')
 COND_LABEL = {'rest': '휴식', '1back': '1-back'}
 MAX_TX_DATA_BYTES = 526
@@ -462,7 +467,7 @@ class Store:
             return None                                  # 마지막 기록 구간 이후 2초까지 도착을 기다림
 
         result = {'task_id': task_id, 'participant_id': pid, 'trial_ms': trial_ms, 'order': list(order),
-                  'blocks': {}, 'tx_ids': [], 'sent': []}
+                  'blocks': {}, 'tx_id': ''}
         for b in blocks:
             result['blocks'][b['cond']] = self._block_result(tp, r, g, b, offset)
         with self.lock:
@@ -509,11 +514,11 @@ class Store:
             sess = self.sessions.get(pid)
             return next((r for r in sess.results if r['task_id'] == task_id), None) if sess else None
 
-    def set_tx(self, pid: str, task_id: str, tx_ids: list[str], sent: list[str]):
+    def set_tx(self, pid: str, task_id: str, tx_id: str):
         with self.lock:
             for r in self.sessions[pid].results:
                 if r['task_id'] == task_id:
-                    r['tx_ids'], r['sent'] = list(tx_ids), list(sent)
+                    r['tx_id'] = tx_id
 
     def session_list(self) -> list[dict]:
         now = now_ms()
@@ -556,10 +561,10 @@ def csv_summary(results: list[dict]) -> bytes:
             'beats', 'excluded', 'coverage', 'quality']
     nb = ['hit', 'miss', 'false_alarm', 'correct_rejection', 'accuracy', 'd_prime', 'mean_rt_hit_ms']
     return csv_bytes(['participant_id', 'task_id', 'condition', 'order', 'trial_ms'] + cols
-                     + ['nback_' + k for k in nb] + ['tx_count', 'warning'],
+                     + ['nback_' + k for k in nb] + ['tx_id', 'warning'],
                      ([r['participant_id'], r['task_id'], b['condition'], b['order'], r['trial_ms']]
                       + [b[c] for c in cols] + [b['nback'][k] if 'nback' in b else '' for k in nb]
-                      + [len(r['tx_ids']), b['warning']] for r, b in _blocks(results)))
+                      + [r['tx_id'], b['warning']] for r, b in _blocks(results)))
 
 
 def csv_ibi(results: list[dict]) -> bytes:
@@ -649,56 +654,85 @@ def tx_data_size(tx_data: dict) -> int:
     return len(json.dumps(tx_data, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
 
 
-def _pack(base: dict, head: dict, ibis: list[int]) -> list[dict]:
-    """한 블록의 IBI를 526바이트 이하 조각들로 나눈다. 첫 조각에 요약(head)."""
-    def fits(rec):
-        return tx_data_size(build_tx_data(rec)) <= MAX_TX_DATA_BYTES
-    parts, i = [], 0
+# ---- IBI 압축 (트랜잭션 하나에 두 블록을 담기 위해) ----
+#   IBI를 정수 ms로 반올림 → 첫 값은 varint(ibi), 다음부터 varint(zigzag(ibi - 직전 ibi))
+#   → 바이트열을 Base85(RFC 1924, Python base64.b85encode)로 문자열화.
+#   차이가 ±63 ms 이내면 1바이트, 그 이상이면 2바이트. 제외된 박동 번호는 따로 "x" 목록에 둔다.
+def _varint(n: int) -> bytes:
+    out = bytearray()
     while True:
-        rec = dict(base, p=len(parts) + 1, n=99, ibi=[], **(head if not parts else {}))
-        if not fits(rec):
-            raise NodeError('기록 머리 부분이 526바이트를 넘습니다.')
-        while i < len(ibis):
-            rec['ibi'].append(ibis[i])
-            if not fits(rec):
-                rec['ibi'].pop()
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def encode_ibis(ibi_ms) -> str:
+    buf, prev = bytearray(), None
+    for v in ibi_ms:
+        v = int(round(v))
+        if prev is None:
+            buf += _varint(v)
+        else:
+            d = v - prev
+            buf += _varint(d * 2 if d >= 0 else -d * 2 - 1)
+        prev = v
+    return base64.b85encode(bytes(buf)).decode('ascii')
+
+
+def decode_ibis(text: str, max_beats: int = 2000) -> list[int]:
+    data = base64.b85decode(text.encode('ascii'))
+    values, prev, i = [], None, 0
+    while i < len(data):
+        n, shift = 0, 0
+        while True:
+            if i >= len(data) or shift > 28:
+                raise ValueError('IBI 데이터가 손상되었습니다.')
+            b = data[i]; i += 1
+            n |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
                 break
-            i += 1
-        if not rec['ibi'] and parts:
-            raise NodeError('IBI 조각을 만들 수 없습니다.')
-        parts.append(rec)
-        if i >= len(ibis):
-            break
-    for rec in parts:
-        rec['n'] = len(parts)
-    return parts
+        v = n if prev is None else prev + (n // 2 if n % 2 == 0 else -(n + 1) // 2)
+        values.append(v); prev = v
+        if len(values) > max_beats:
+            raise ValueError('IBI 개수가 너무 많습니다.')
+    return values
 
 
-def build_records(result: dict) -> list[dict]:
-    """블록(휴식, 1-back)마다 기록을 만들고 진행 순서대로 이어 붙인다."""
-    parts = []
+def build_record(result: dict) -> dict:
+    """휴식 + 1-back을 한 기록으로. 요약 통계는 IBI에서 다시 계산할 수 있으므로 넣지 않는다."""
+    first = result['blocks'][result['order'][0]]
+    t0 = datetime.fromisoformat(first['rec_start_utc'])
+    rec = {'schema': SCHEMA, 'mid': result['task_id'][:12], 'pid': result['participant_id'],
+           'ms': result['trial_ms'], 'o': ''.join(COND_KEY[c] for c in result['order']),
+           't': first['rec_start_utc'][:19] + 'Z'}
     for cond in result['order']:
         b = result['blocks'][cond]
-        base = {'schema': SCHEMA, 'mid': result['task_id'], 'pid': result['participant_id'],
-                'c': cond, 'o': b['order']}
-        head = {'t': b['rec_start_utc'][:19] + 'Z', 'hr': b['hr_bpm'], 'sdnn': b['sdnn_ms'],
-                'rmssd': b['rmssd_ms'],
-                'b0': int(round(b['first_beat_ms'])) if b['first_beat_ms'] is not None else None}
+        blk = {}
+        d = int(round((datetime.fromisoformat(b['rec_start_utc']) - t0).total_seconds() * 1000))
+        if d:
+            blk['d'] = d                                          # 첫 블록 기록 시작부터의 간격(ms)
+        if b['first_beat_ms'] is not None:
+            blk['b0'] = int(round(b['first_beat_ms']))
+        blk['ibi'] = encode_ibis(b['ibi_ms'])
+        excluded = [i for i, ok in enumerate(b['valid']) if not ok]
+        if excluded:
+            blk['x'] = excluded
         if 'nback' in b:
             nb, rt = b['nback'], b['nback']['mean_rt_hit_ms']
-            head['nb'] = [nb['hit'], nb['miss'], nb['false_alarm'], nb['correct_rejection'],
-                          int(round(rt)) if rt is not None else None, result['trial_ms']]
-        ibis = [int(round(v)) if ok else -int(round(v)) for v, ok in zip(b['ibi_ms'], b['valid'])]
-        parts.extend(_pack(base, head, ibis))
-    return parts
+            blk['nb'] = [nb['hit'], nb['miss'], nb['false_alarm'], nb['correct_rejection'],
+                         int(round(rt)) if rt is not None else None]
+        rec[COND_KEY[cond]] = blk
+    return rec
 
 
-def part_key(rec: dict) -> str:
-    return f"{rec['c']}:{rec['p']}"
+def record_size(result: dict) -> int:
+    return tx_data_size(build_tx_data(build_record(result)))
 
 
-def used_parts() -> set[tuple[str, str]]:
-    """체인과 mempool에 이미 있는 (측정 ID, "조건:조각 번호")."""
+def chain_texts() -> list[str]:
+    """컨트랙트 상태(확정)와 mempool(대기)의 upload_text 내용."""
     if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
         raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
     if node_request('GET', '/status').get('is_synced') is not True:
@@ -716,55 +750,187 @@ def used_parts() -> set[tuple[str, str]]:
             d = tx.get('data', {})
             if d.get('contract_addr') == CONTRACT_ADDR and d.get('method') == 'upload_text':
                 texts.append((d.get('args') or {}).get('text', ''))
-    used = set()
-    for text in texts:
+    return texts
+
+
+def used_mids() -> set[str]:
+    mids = set()
+    for text in chain_texts():
         try:
             c = json.loads(text)
-            if isinstance(c, dict) and c.get('schema') == SCHEMA and isinstance(c.get('mid'), str) \
-                    and isinstance(c.get('c'), str) and isinstance(c.get('p'), int):
-                used.add((c['mid'], f"{c['c']}:{c['p']}"))
+            if isinstance(c, dict) and c.get('schema') == SCHEMA and isinstance(c.get('mid'), str):
+                mids.add(c['mid'])
         except (TypeError, ValueError):
             continue
-    return used
+    return mids
 
 
-def save_to_blockchain(store: Store, result: dict) -> list[str]:
+def save_to_blockchain(store: Store, result: dict) -> str:
     if all(b['hr_bpm'] is None for b in result['blocks'].values()):
         raise NodeError('IBI 결과가 없는 측정은 저장할 수 없습니다.')
+    if result.get('tx_id'):
+        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
     allowed = config('ALLOWED_PARTICIPANT_CODES')
     if allowed and result['participant_id'] not in {v.strip().upper() for v in allowed.split(',')}:
         raise NodeError('이 참가자 코드는 저장이 허용되지 않았습니다.')
-    parts = build_records(result)
-    tx_ids, sent = list(result.get('tx_ids') or []), list(result.get('sent') or [])
-    if all(part_key(rec) in sent for rec in parts):
-        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
+    record = build_record(result)
+    tx_data = build_tx_data(record)
+    size = tx_data_size(tx_data)
+    if size > MAX_TX_DATA_BYTES:
+        raise NodeError(f'기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘습니다. '
+                        '설정에서 숫자 간격을 줄여 다시 측정하세요.')
     key = service_signing_key()
     wallet, public = wallet_address(key)
     with store.submit_lock:
-        used = {k for mid, k in used_parts() if mid == result['task_id']} | set(sent)
-        todo = [rec for rec in parts if part_key(rec) not in used]   # 이미 보낸 조각은 건너뜀 (재시도 대비)
-        if not todo:
+        if record['mid'] in used_mids():
             raise NodeError('이 측정은 이미 블록체인에 저장(또는 대기)되어 있습니다.')
-        nonce = int(node_request('GET', f'/account/{wallet}/nonce')['next_nonce'])
-        for k, rec in enumerate(todo):               # 조각들은 nonce를 1씩 늘려 연속 전송
-            tx_data = build_tx_data(rec)
-            fee = node_request('POST', '/fee/estimate', json={'tx_type': 'CONTRACT_CALL', 'data': tx_data})
-            tx = {'sender': wallet, 'recipient': CONTRACT_ADDR, 'amount_xbit': 0,
-                  'fee_xbit': int(fee['required_fee_xbit']), 'nonce': nonce + k,
-                  'timestamp': time.time(), 'tx_type': 'CONTRACT_CALL', 'data': tx_data}
-            sig = key.sign(canonical_tx_bytes(tx))
-            res = node_request('POST', '/contract/call', json={
-                'contract_addr': CONTRACT_ADDR, 'method': 'upload_text', 'args': tx_data['args'],
-                'sender': wallet, 'sender_pub_b64': base64.b64encode(public).decode('ascii'),
-                'sig_b64': base64.b64encode(sig).decode('ascii'), 'value_xbit': 0,
-                'fee_xbit': tx['fee_xbit'], 'nonce': tx['nonce'], 'timestamp': tx['timestamp']})
-            tx_id = str(res.get('tx_id', ''))
-            if not TX_ID_RE.fullmatch(tx_id):
-                raise NodeError(f'{COND_LABEL[rec["c"]]} {rec["p"]}번째 조각: 노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
-            tx_ids.append(tx_id)
-            sent.append(part_key(rec))
-            store.set_tx(result['participant_id'], result['task_id'], tx_ids, sent)
-    return tx_ids
+        nonce = node_request('GET', f'/account/{wallet}/nonce')
+        fee = node_request('POST', '/fee/estimate', json={'tx_type': 'CONTRACT_CALL', 'data': tx_data})
+        tx = {'sender': wallet, 'recipient': CONTRACT_ADDR, 'amount_xbit': 0,
+              'fee_xbit': int(fee['required_fee_xbit']), 'nonce': int(nonce['next_nonce']),
+              'timestamp': time.time(), 'tx_type': 'CONTRACT_CALL', 'data': tx_data}
+        sig = key.sign(canonical_tx_bytes(tx))
+        res = node_request('POST', '/contract/call', json={
+            'contract_addr': CONTRACT_ADDR, 'method': 'upload_text', 'args': tx_data['args'],
+            'sender': wallet, 'sender_pub_b64': base64.b64encode(public).decode('ascii'),
+            'sig_b64': base64.b64encode(sig).decode('ascii'), 'value_xbit': 0,
+            'fee_xbit': tx['fee_xbit'], 'nonce': tx['nonce'], 'timestamp': tx['timestamp']})
+    tx_id = str(res.get('tx_id', ''))
+    if not TX_ID_RE.fullmatch(tx_id):
+        raise NodeError('노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
+    store.set_tx(result['participant_id'], result['task_id'], tx_id)
+    return tx_id
+
+
+# ---- 블록체인 보기: 컨트랙트 전체 기록 읽기 / 해석 / 엑셀 ----
+def fetch_contract_items() -> list[dict]:
+    if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
+        raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
+    snap = node_request('GET', f'/contract/{CONTRACT_ADDR}')
+    items = (snap.get('state') or {}).get('data_items', [])
+    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
+
+def _at_utc(value) -> str:
+    """블록 시각(at): 초 또는 ms 숫자, 또는 ISO 문자열."""
+    if _num(value):
+        sec = value / 1000 if value > 1e11 else value
+        try:
+            return datetime.fromtimestamp(sec, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        except (OverflowError, OSError, ValueError):
+            return ''
+    return str(value)[:40] if value is not None else ''
+
+
+def _safe_cell(v):
+    """엑셀(XML)에 쓸 수 없는 제어 문자 제거. 수식 방지는 excel_bytes에서 셀 형식으로 처리."""
+    if isinstance(v, str):
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        return ILLEGAL_CHARACTERS_RE.sub('', v)
+    return v
+
+
+def _check_ibis(ibi) -> list[int]:
+    if any(not isinstance(v, int) or not 200 <= v <= 3000 for v in ibi):
+        raise ValueError('IBI 값 범위 오류 (손상되었거나 다른 형식의 기록)')
+    return ibi
+
+
+def parse_items(items: list[dict]) -> dict:
+    """전체 기록 표 + PPG 기록(현재/이전 형식) 해석 결과."""
+    raw, blocks, beats = [], [], []
+    legacy: dict[tuple, dict] = {}          # 이전 다중 조각 형식 모으기
+    for it in items:
+        text = it.get('text', '')
+        text = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+        try:
+            content = json.loads(text)
+        except (TypeError, ValueError):
+            content = None
+        schema = content.get('schema', '') if isinstance(content, dict) else ''
+        raw.append({'index': it.get('index'), 'record_id': str(it.get('id', '')), 'block_time_utc': _at_utc(it.get('at')),
+                    'sender': str(it.get('by', '')), 'title': str(it.get('title', '')),
+                    'schema': str(schema), 'text': text})
+        if not isinstance(content, dict):
+            continue
+        try:
+            if schema == SCHEMA:
+                pid, mid = validate_pid(content.get('pid')), str(content.get('mid', ''))[:32]
+                t0 = datetime.fromisoformat(str(content.get('t', '')).replace('Z', '+00:00'))
+                for k, key in enumerate(str(content.get('o', ''))[:2], start=1):
+                    blk, cond = content.get(key), KEY_COND.get(key)
+                    if not isinstance(blk, dict) or cond is None:
+                        continue
+                    ibi = _check_ibis(decode_ibis(str(blk.get('ibi', ''))))
+                    excluded = {i for i in blk.get('x', []) if isinstance(i, int)}
+                    valid = [i not in excluded for i in range(len(ibi))]
+                    d = blk.get('d', 0) if _num(blk.get('d', 0)) else 0
+                    t = (t0 + timedelta(milliseconds=d)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    nb = blk.get('nb') if isinstance(blk.get('nb'), list) else None
+                    _add_block(blocks, beats, it, schema, mid, pid, cond, k, t, content.get('ms'), ibi, valid, nb)
+            elif schema in ('ppg_rest_1back_v1', 'ppg_1back_v1'):
+                cond = content.get('c', '1back') if schema == 'ppg_rest_1back_v1' else '1back'
+                key = (schema, str(content.get('mid', '')), cond)
+                g = legacy.setdefault(key, {'item': it, 'parts': {}, 'head': None})
+                g['parts'][int(content.get('p', 1))] = [int(v) for v in content.get('ibi', [])]
+                if int(content.get('p', 1)) == 1:
+                    g['head'] = content
+        except (ValueError, TypeError, KeyError):
+            continue
+    for (schema, mid, cond), g in legacy.items():
+        h = g['head'] or {}
+        try:
+            pid = validate_pid(h.get('pid'))
+        except ValueError:
+            continue
+        ibis = [v for p in sorted(g['parts']) for v in g['parts'][p]]
+        try:
+            _check_ibis([abs(v) for v in ibis])
+        except ValueError:
+            continue
+        nb = h.get('nb')[:5] if isinstance(h.get('nb'), list) else None
+        _add_block(blocks, beats, g['item'], schema, mid, pid, cond, h.get('o', 1), h.get('t'),
+                   (h.get('nb') or [None] * 6)[5] if isinstance(h.get('nb'), list) and len(h['nb']) > 5 else None,
+                   [abs(v) for v in ibis], [v > 0 for v in ibis], nb)
+    return {'raw': raw, 'blocks': blocks, 'beats': beats}
+
+
+def _add_block(blocks, beats, item, schema, mid, pid, cond, order, t, trial_ms, ibi, valid, nb):
+    stats = hrv_stats(ibi, valid) if ibi else hrv_stats([], [])
+    nb = nb if isinstance(nb, list) and len(nb) >= 4 else None
+    blocks.append({
+        'participant_id': pid, 'measurement_id': mid, 'condition': cond, 'order': order,
+        'rec_start_utc': str(t or '')[:20], 'trial_ms': trial_ms, 'beats_valid': stats['beats'],
+        'beats_excluded': len(ibi) - stats['beats'], 'hr_bpm': stats['hr_bpm'], 'mean_ibi_ms': stats['ibi_ms'],
+        'sdnn_ms': stats['sdnn_ms'], 'rmssd_ms': stats['rmssd_ms'],
+        'nback_hit': nb[0] if nb else None, 'nback_miss': nb[1] if nb else None,
+        'nback_false_alarm': nb[2] if nb else None, 'nback_correct_rejection': nb[3] if nb else None,
+        'nback_mean_rt_ms': nb[4] if nb and len(nb) > 4 else None,
+        'record_index': item.get('index'), 'block_time_utc': _at_utc(item.get('at')), 'schema': schema,
+    })
+    for k, (v, ok) in enumerate(zip(ibi, valid), start=1):
+        beats.append({'participant_id': pid, 'measurement_id': mid, 'condition': cond, 'order': order,
+                      'beat': k, 'ibi_ms': v, 'valid': ok})
+
+
+def excel_bytes(parsed: dict) -> bytes:
+    import pandas as pd
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as xw:
+        for name, rows in (('PPG 요약', parsed['blocks']), ('PPG IBI', parsed['beats']), ('전체 기록', parsed['raw'])):
+            df = pd.DataFrame(rows) if rows else pd.DataFrame({'(없음)': []})
+            df = df.apply(lambda col: col if pd.api.types.is_numeric_dtype(col) else col.map(_safe_cell))
+            df.to_excel(xw, sheet_name=name, index=False)
+            ws = xw.sheets[name]
+            for row in ws.iter_rows():          # 체인의 '=...' 문자열이 수식으로 실행되지 않게 텍스트로 고정
+                for c in row:
+                    if c.data_type == 'f':
+                        c.data_type = 's'
+            for col in ws.columns:              # 열 너비 대충 맞추기
+                width = max(len(str(c.value or '')) for c in col[:200])
+                ws.column_dimensions[col[0].column_letter].width = min(60, max(8, width + 2))
+            ws.freeze_panes = 'A2'
+    return buf.getvalue()
 
 
 # ============================================================
@@ -1226,12 +1392,62 @@ def make_preview(live: dict | None) -> dict | None:
 # ============================================================
 # 5. 화면
 # ============================================================
+@st.cache_data(ttl=20, show_spinner=False)
+def _load_chain(version: str, nonce: int):
+    items = fetch_contract_items()
+    return parse_items(items)
+
+
+def chain_page():
+    st.markdown("### ⛓️ 블록체인 기록")
+    st.caption(f"컨트랙트 `{CONTRACT_ADDR}` · 노드 `{NODE_URL}`")
+    if st.button("🔄 새로 불러오기"):
+        st.session_state['chain_nonce'] = st.session_state.get('chain_nonce', 0) + 1
+    try:
+        with st.spinner("블록체인에서 기록을 불러오는 중..."):
+            parsed = _load_chain(CODE_VERSION, st.session_state.get('chain_nonce', 0))
+    except NodeError as exc:
+        st.error(str(exc))
+        return
+    import pandas as pd
+    raw, blocks, beats = parsed['raw'], parsed['blocks'], parsed['beats']
+    m = st.columns(3)
+    m[0].metric("전체 기록", len(raw))
+    m[1].metric("PPG 측정", len({(b['measurement_id'], b['participant_id']) for b in blocks}))
+    m[2].metric("참가자", len({b['participant_id'] for b in blocks}))
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
+    st.download_button("📥 엑셀로 내려받기 (.xlsx)", excel_bytes(parsed), f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문)")
+
+    st.subheader("PPG 측정 (블록별)")
+    if blocks:
+        df = pd.DataFrame(blocks)
+        pids = sorted(df['participant_id'].unique())
+        chosen = st.multiselect("참가자 필터", pids)
+        if chosen:
+            df = df[df['participant_id'].isin(chosen)]
+        df['condition'] = df['condition'].map(COND_LABEL).fillna(df['condition'])
+        st.dataframe(df[['participant_id', 'measurement_id', 'condition', 'order', 'rec_start_utc', 'hr_bpm',
+                         'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms', 'beats_valid', 'beats_excluded', 'nback_hit',
+                         'nback_miss', 'nback_false_alarm', 'nback_mean_rt_ms', 'block_time_utc', 'schema']],
+                     hide_index=True)
+    else:
+        st.caption("PPG 기록이 없습니다.")
+
+    st.subheader("전체 기록 (원문)")
+    if raw:
+        st.dataframe(pd.DataFrame(raw)[['index', 'block_time_utc', 'schema', 'title', 'sender', 'text']], hide_index=True)
+    else:
+        st.caption("컨트랙트에 기록이 없습니다.")
+
+
 def phone_page():
     st.markdown("### 📷 PPG 측정 (휴식 / 1-back)")
     pid_raw = st.text_input("참가자 코드", placeholder="P01", max_chars=4)
     with st.expander("설정"):
-        trial_s = st.number_input("숫자 간격 (초)", 1.0, 6.0, DEFAULT_TRIAL_MS / 1000, 0.5,
-                                  help=f"블록마다 IBI 기록 구간 = {N_REC}칸 × 간격 (휴식 블록도 같은 길이)")
+        trial_s = st.number_input("숫자 간격 (초)", 1.0, 4.0, DEFAULT_TRIAL_MS / 1000, 0.5,
+                                  help=f"블록마다 IBI 기록 구간 = {N_REC}칸 × 간격 (휴식 블록도 같은 길이). 두 블록을 트랜잭션 1개(526바이트)에 담기 위해 최대 4초.")
         st.caption(f"블록당 {N_TOTAL}칸 ({N_TOTAL * trial_s:.0f}초), IBI 기록 {N_REC * trial_s:.0f}초 · "
                    f"휴식 + 1-back 2개 블록, 순서 무작위 · 총 약 {2 * (N_TOTAL * trial_s + BREAK_S):.0f}초")
     if not pid_raw:
@@ -1290,29 +1506,25 @@ def phone_panel(pid: str, trial_ms: int):
     if result is None:
         return
     st.divider()
-    try:
-        n_parts = len(build_records(result))
-    except NodeError as exc:
-        st.error(str(exc))
-        return
-    n_sent = len(result['sent'])
-    if result['tx_ids'] and n_sent >= n_parts:
-        st.success(f"블록체인 저장 요청 완료 ({len(result['tx_ids'])}개 트랜잭션)")
-        for t in result['tx_ids']:
-            st.code(t, language=None)
+    size = record_size(result)
+    if result['tx_id']:
+        st.success("블록체인 저장 요청 완료 (트랜잭션 1개)")
+        st.code(result['tx_id'], language=None)
+        st.caption("상단의 [블록체인 보기]에서 기록을 확인할 수 있습니다. 블록이 만들어진 뒤에 나타납니다.")
     elif all(b['hr_bpm'] is None for b in result['blocks'].values()):
         st.warning("IBI 결과가 없어 저장할 수 없습니다. 다시 측정하세요.")
+    elif size > MAX_TX_DATA_BYTES:
+        st.error(f"기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘어 트랜잭션 하나에 담을 수 없습니다. "
+                 "설정에서 숫자 간격을 줄여 다시 측정하세요.")
     else:
-        if n_sent:
-            st.warning(f"{n_parts}개 조각 중 {n_sent}개만 저장되었습니다. [블록체인 저장]을 다시 누르면 남은 조각만 보냅니다.")
         n_ibi = sum(len(b['ibi_ms']) for b in result['blocks'].values())
-        st.caption(f"휴식·1-back IBI {n_ibi}개 + 1-back 결과를 기록합니다 (트랜잭션 {n_parts}개). "
-                   "공개 블록체인 기록은 삭제할 수 없습니다.")
+        st.caption(f"휴식·1-back IBI {n_ibi}개 + 1-back 결과를 트랜잭션 1개로 기록합니다 "
+                   f"({size} / {MAX_TX_DATA_BYTES}바이트). 공개 블록체인 기록은 삭제할 수 없습니다.")
         if st.button("🔗 블록체인 저장", type="primary", key=f"save_{result['task_id']}"):
             try:
                 with st.spinner("서명 및 전송 중..."):
-                    tx_ids = save_to_blockchain(store, result)
-                state['saved'] = {'task_id': result['task_id'], 'text': f'블록체인 저장 요청 완료 (트랜잭션 {len(tx_ids)}개)'}
+                    save_to_blockchain(store, result)
+                state['saved'] = {'task_id': result['task_id'], 'text': '블록체인 저장 요청 완료 (트랜잭션 1개)'}
                 st.rerun(scope="fragment")
             except NodeError as exc:
                 st.error(f"저장 실패: {exc}")
@@ -1371,7 +1583,7 @@ def monitor_page():
              '1-back 정확도': b['nback']['accuracy'] if 'nback' in b else None,
              "d'": b['nback']['d_prime'] if 'nback' in b else None,
              'RT': b['nback']['mean_rt_hit_ms'] if 'nback' in b else None,
-             '저장 tx': len(r['tx_ids']), '경고': b['warning']} for r, b in _blocks(results)]
+             '저장 tx': r['tx_id'][:12], '경고': b['warning']} for r, b in _blocks(results)]
     st.dataframe(pd.DataFrame(rows), hide_index=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button("블록 요약 CSV", csv_summary(results), "ppg_rest_1back_summary.csv", "text/csv")
@@ -1413,6 +1625,11 @@ def main():
                        layout="wide" if is_monitor else "centered")
     if is_monitor:
         monitor_page()
+        return
+    view = st.radio("화면", ["📷 측정", "⛓️ 블록체인 보기"], horizontal=True, label_visibility="collapsed",
+                    help="측정 중에 [블록체인 보기]로 바꾸면 진행 중인 측정이 중단됩니다.")
+    if view.endswith("블록체인 보기"):
+        chain_page()
     else:
         phone_page()
 
