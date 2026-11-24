@@ -14,14 +14,16 @@
                     16~20칸 마무리 구간 (기록 안 함)
                   휴식 블록: 화면의 + 를 바라보며 가만히 있기 (응답 없음)
                   1-back 블록: 숫자가 바로 앞 숫자와 같으면 [일치]
-                  블록 사이에 안내 + 5초 카운트다운
+                  각 블록이 끝나면 인지부하 점수(0 전혀 부하 없음 ~ 10 매우 부하 높음)를 슬라이더로 입력
+                  첫 블록 전 5초 안내, 두 블록 사이에는 점수 입력 후 50초 대기 (측정은 계속)
   3) [블록체인 저장]  두 블록의 IBI + 1-back 결과를 트랜잭션 1개로 XperChain LogBook에 기록
-  상단 [데이터 보기]  컨트랙트의 모든 기록을 표로 보여 주고 엑셀(.xlsx)로 내려받기
+  상단 [데이터 보기]  PPG 기록을 한국 시간(KST)으로 표로 보여 주고 엑셀(.xlsx)로 내려받기
 
 블록체인 기록 형식 (schema = prb3, 노드의 526바이트 제한 안에 두 블록을 담도록 압축)
   {"schema":"prb3","mid":측정ID,"pid":"P01","ms":숫자간격 ms,"o":"rb"(진행 순서: r=휴식, b=1-back),
    "t":첫 블록 기록 시작 UTC,
-   "r":{"d":t부터 이 블록 기록 시작까지 ms(첫 블록은 생략),"b0":기록 시작~첫 박동 ms,"ibi":압축 IBI,"x":[제외 박동 번호]},
+   "r":{"d":t부터 이 블록 기록 시작까지 ms(첫 블록은 생략),"b0":기록 시작~첫 박동 ms,"ibi":압축 IBI,"x":[제외 박동 번호],
+        "l":인지부하 점수 0-10},
    "b":{ ...휴식과 같음..., "nb":[적중,놓침,오경보,정기각,적중 평균 RT ms]}}
   ibi 압축: 정수 ms IBI를 첫 값은 varint(ibi), 다음부터 varint(zigzag(차이))로 바이트열을 만든 뒤
             Base85(Python base64.b85encode). 앱의 decode_ibis()로 풀 수 있고,
@@ -94,8 +96,10 @@ N_PRE, N_REC, N_POST = 5, 10, 5
 N_TOTAL = N_PRE + N_REC + N_POST
 STIM_MS = 500                      # 숫자 제시 시간
 DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (블록당 기록 구간 = 10 × 2.5초 = 25초). 화면 설정 없이 고정.
-                                   # 바꾸려면 이 값을 수정 (트랜잭션 526바이트 제한 때문에 최대 4000 권장)
-BREAK_S = 5                        # 블록 시작 전 안내 + 카운트다운
+                                   # 바꾸려면 이 값을 수정 (트랜잭션 526바이트 제한 때문에 최대 3500 권장)
+BREAK_S = 5                        # 첫 블록 시작 전 안내 + 카운트다운
+GAP_S = 50                         # 두 블록 사이 대기 (인지부하 점수 입력 후)
+KST = timezone(timedelta(hours=9))  # 화면 표시용 한국 시간
 
 # 화면 상단 메뉴 아이콘/이름. 아이콘은 이모지 또는 Streamlit 머티리얼 아이콘(:material/이름:)
 #   다른 후보: ':material/ecg_heart:', ':material/cardiology:', '🫀', '💓'
@@ -455,8 +459,11 @@ class Store:
                     rt = t.get('rt')
                     rt = round(float(rt), 1) if responded and _num(rt) and 0 <= rt <= 6000 else None
                     trials.append({'s': sv, 'r': responded, 'rt': rt})
+            load = b.get('load')
+            if isinstance(load, bool) or not isinstance(load, int) or not 0 <= load <= 10:
+                raise ValueError('인지부하 점수(0~10)가 없습니다.')
             blocks.append({'cond': cond, 'order': i + 1, 'start': start, 'rec_start': rec_start,
-                           'rec_end': rec_end, 'end': end, 'trials': trials})
+                           'rec_end': rec_end, 'end': end, 'trials': trials, 'load': load})
 
         with self.lock:
             sess = self.sessions.get(pid)
@@ -484,7 +491,7 @@ class Store:
     def _block_result(tp, r, g, b, offset) -> dict:
         rec_start, rec_end = b['rec_start'], b['rec_end']
         out = {
-            'condition': b['cond'], 'order': b['order'],
+            'condition': b['cond'], 'order': b['order'], 'load': b['load'],
             'rec_start_utc': utc_iso(rec_start + offset), 'rec_duration_s': round((rec_end - rec_start) / 1000, 1),
             'ibi_ms': [], 'valid': [], 'ibi_t_s': [], 'first_beat_ms': None,
             'hr_bpm': None, 'mean_ibi_ms': None, 'sdnn_ms': None, 'rmssd_ms': None,
@@ -563,7 +570,7 @@ def _blocks(results):
 
 
 def csv_summary(results: list[dict]) -> bytes:
-    cols = ['rec_start_utc', 'rec_duration_s', 'hr_bpm', 'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms',
+    cols = ['rec_start_utc', 'rec_duration_s', 'load', 'hr_bpm', 'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms',
             'beats', 'excluded', 'coverage', 'quality']
     nb = ['hit', 'miss', 'false_alarm', 'correct_rejection', 'accuracy', 'd_prime', 'mean_rt_hit_ms']
     return csv_bytes(['participant_id', 'task_id', 'condition', 'order', 'trial_ms'] + cols
@@ -725,6 +732,7 @@ def build_record(result: dict) -> dict:
         excluded = [i for i, ok in enumerate(b['valid']) if not ok]
         if excluded:
             blk['x'] = excluded
+        blk['l'] = b['load']                                       # 인지부하 점수 0-10
         if 'nback' in b:
             nb, rt = b['nback'], b['nback']['mean_rt_hit_ms']
             blk['nb'] = [nb['hit'], nb['miss'], nb['false_alarm'], nb['correct_rejection'],
@@ -817,15 +825,28 @@ def fetch_contract_items() -> list[dict]:
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
 
 
-def _at_utc(value) -> str:
-    """블록 시각(at): 초 또는 ms 숫자, 또는 ISO 문자열."""
+def to_kst(value) -> str:
+    """UTC ISO 문자열('...Z' 또는 '+00:00') → 한국 시간 'YYYY-MM-DD HH:MM:SS'. 해석 못 하면 원문."""
+    if not value:
+        return ''
+    try:
+        t = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t.astimezone(KST).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return str(value)[:40]
+
+
+def _at_kst(value) -> str:
+    """블록 시각(at): 초 또는 ms 숫자, 또는 ISO 문자열 → 한국 시간."""
     if _num(value):
         sec = value / 1000 if value > 1e11 else value
         try:
-            return datetime.fromtimestamp(sec, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            return datetime.fromtimestamp(sec, KST).strftime('%Y-%m-%d %H:%M:%S')
         except (OverflowError, OSError, ValueError):
             return ''
-    return str(value)[:40] if value is not None else ''
+    return to_kst(value) if value is not None else ''
 
 
 def _safe_cell(v):
@@ -854,7 +875,7 @@ def parse_items(items: list[dict]) -> dict:
         except (TypeError, ValueError):
             content = None
         schema = content.get('schema', '') if isinstance(content, dict) else ''
-        raw.append({'index': it.get('index'), 'record_id': str(it.get('id', '')), 'block_time_utc': _at_utc(it.get('at')),
+        raw.append({'index': it.get('index'), 'record_id': str(it.get('id', '')), 'block_time_kst': _at_kst(it.get('at')),
                     'sender': str(it.get('by', '')), 'title': str(it.get('title', '')),
                     'schema': str(schema), 'text': text})
         if not isinstance(content, dict):
@@ -873,7 +894,8 @@ def parse_items(items: list[dict]) -> dict:
                     d = blk.get('d', 0) if _num(blk.get('d', 0)) else 0
                     t = (t0 + timedelta(milliseconds=d)).strftime('%Y-%m-%dT%H:%M:%SZ')
                     nb = blk.get('nb') if isinstance(blk.get('nb'), list) else None
-                    _add_block(blocks, beats, it, schema, mid, pid, cond, k, t, content.get('ms'), ibi, valid, nb)
+                    load = blk.get('l') if isinstance(blk.get('l'), int) and 0 <= blk.get('l') <= 10 else None
+                    _add_block(blocks, beats, it, schema, mid, pid, cond, k, t, content.get('ms'), ibi, valid, nb, load)
             elif schema in ('ppg_rest_1back_v1', 'ppg_1back_v1'):
                 cond = content.get('c', '1back') if schema == 'ppg_rest_1back_v1' else '1back'
                 key = (schema, str(content.get('mid', '')), cond)
@@ -901,18 +923,18 @@ def parse_items(items: list[dict]) -> dict:
     return {'raw': raw, 'blocks': blocks, 'beats': beats}
 
 
-def _add_block(blocks, beats, item, schema, mid, pid, cond, order, t, trial_ms, ibi, valid, nb):
+def _add_block(blocks, beats, item, schema, mid, pid, cond, order, t, trial_ms, ibi, valid, nb, load=None):
     stats = hrv_stats(ibi, valid) if ibi else hrv_stats([], [])
     nb = nb if isinstance(nb, list) and len(nb) >= 4 else None
     blocks.append({
         'participant_id': pid, 'measurement_id': mid, 'condition': cond, 'order': order,
-        'rec_start_utc': str(t or '')[:20], 'trial_ms': trial_ms, 'beats_valid': stats['beats'],
+        'rec_start_kst': to_kst(t), 'cognitive_load': load, 'trial_ms': trial_ms, 'beats_valid': stats['beats'],
         'beats_excluded': len(ibi) - stats['beats'], 'hr_bpm': stats['hr_bpm'], 'mean_ibi_ms': stats['ibi_ms'],
         'sdnn_ms': stats['sdnn_ms'], 'rmssd_ms': stats['rmssd_ms'],
         'nback_hit': nb[0] if nb else None, 'nback_miss': nb[1] if nb else None,
         'nback_false_alarm': nb[2] if nb else None, 'nback_correct_rejection': nb[3] if nb else None,
         'nback_mean_rt_ms': nb[4] if nb and len(nb) > 4 else None,
-        'record_index': item.get('index'), 'block_time_utc': _at_utc(item.get('at')), 'schema': schema,
+        'record_index': item.get('index'), 'block_time_kst': _at_kst(item.get('at')), 'schema': schema,
     })
     for k, (v, ok) in enumerate(zip(ibi, valid), start=1):
         beats.append({'participant_id': pid, 'measurement_id': mid, 'condition': cond, 'order': order,
@@ -986,6 +1008,12 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
   td:not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; }
   th { font-weight:500; color:#8a96a3; text-align:right; padding:4px; font-size:13px; }
   .warn { color:#fbbf24; font-size:14px; margin-top:8px; }
+  #rateTitle { text-align:center; font-size:18px; line-height:1.6; margin:10px 0 6px; }
+  #rateValue { text-align:center; font-size:64px; font-weight:700; color:#64748b; margin:10px 0; font-variant-numeric:tabular-nums; }
+  #rateValue.set { color:#eef1f4; }
+  #rateSlider { width:100%; height:44px; accent-color:#3b82f6; margin:0; }
+  .scale { display:flex; justify-content:space-between; color:#8a96a3; font-size:13px; }
+  .ticks { display:flex; justify-content:space-between; color:#6b7280; font-size:12px; padding:0 6px; font-variant-numeric:tabular-nums; }
   video { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 </style></head>
 <body><div class="wrap">
@@ -1014,6 +1042,16 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
     <div id="stimBox"><span id="stim"></span><span id="fix" class="hidden">+</span></div>
     <div id="taskMsg"></div>
     <button id="matchBtn">일치</button>
+  </div>
+
+  <div id="v-rate" class="hidden">
+    <div id="rateTitle"></div>
+    <div id="rateValue">–</div>
+    <input id="rateSlider" type="range" min="0" max="10" step="1" value="5">
+    <div class="ticks"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span></div>
+    <div class="scale"><span>전혀 부하 없음</span><span>매우 부하 높음</span></div>
+    <div class="hint">손가락은 카메라 위에 그대로 두고, 오른손으로 슬라이더를 움직여 주세요.</div>
+    <button id="rateBtn" disabled>확인</button>
   </div>
 
   <div id="v-done" class="hidden">
@@ -1046,7 +1084,7 @@ let stream = null, track = null, sampling = false, queue = [], runId = "", seq =
 let sendTimer = null, fallbackTimer = null, wakeLock = null, lastMediaTime = -1;
 let taskId = "", trialMs = 2500, nPre = 5, nRec = 10, nPost = 5, stimMs = 500;
 let digits = [], trials = [], cur = null, t0 = 0, timers = [], taskPayload = null, gotResult = false;
-let order = [], blocksOut = [], breakS = 5;
+let order = [], blocksOut = [], breakS = 5, gapS = 50, rateDone = null, rateTouched = false;
 const LABEL = { rest: "휴식", "1back": "1-back" };
 const COLOR = { rest: "#60a5fa", "1back": "#f59e0b" };
 
@@ -1062,7 +1100,7 @@ const QMSG = {
 
 function showView(v) {
   mode = v;
-  for (const k of ["idle", "prep", "task", "done"]) $("v-" + k).classList.toggle("hidden", k !== v);
+  for (const k of ["idle", "prep", "task", "rate", "done"]) $("v-" + k).classList.toggle("hidden", k !== v);
   setHeight();
 }
 function randomId() { const a = new Uint8Array(12); crypto.getRandomValues(a); return Array.from(a, b => b.toString(16).padStart(2, "0")).join(""); }
@@ -1125,7 +1163,7 @@ async function startCamera() {
 function stopCamera() {
   sampling = false;
   if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
-  if (track) { try { track.applyConstraints({ advanced: [{ torch: false }] }); } catch (e) {} }
+  if (track) { track.applyConstraints({ advanced: [{ torch: false }] }).catch(() => {}); }   // 플래시 없는 기기는 무시
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = track = null;
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
@@ -1202,7 +1240,7 @@ function later(fn, ms) { timers.push(setTimeout(fn, Math.max(0, ms))); }
 
 function startSession() {
   trialMs = Math.round(args.trial_ms || 2500); nPre = args.n_pre || 5; nRec = args.n_rec || 10;
-  nPost = args.n_post || 5; stimMs = args.stim_ms || 500; breakS = args.break_s || 5;
+  nPost = args.n_post || 5; stimMs = args.stim_ms || 500; breakS = args.break_s || 5; gapS = args.gap_s || 50;
   const r = new Uint8Array(1); crypto.getRandomValues(r);
   order = (r[0] & 1) ? ["rest", "1back"] : ["1back", "rest"];      // 블록 순서 무작위
   taskId = randomId(); gotResult = false; taskPayload = null; blocksOut = []; cur = null;
@@ -1220,9 +1258,13 @@ function runBlock(bi) {
   const guide = cond === "rest"
     ? "<b>휴식</b><br>화면 가운데 + 를 편안히 바라보세요.<br>손가락은 그대로 두고 움직이지 마세요."
     : "<b>1-back</b><br>숫자가 <b>바로 앞 숫자와 같으면</b> [일치]를 누르세요.";
-  let k = breakS;
+  const waiting = bi > 0;                               // 두 번째 블록 앞: 50초 대기
+  let k = waiting ? gapS : breakS;
   const tickDown = () => {
-    $("taskMsg").innerHTML = `${guide}<br><span style="font-size:42px">${k}</span>`;
+    const head = waiting && k > breakS
+      ? `<span style="color:#8a96a3">잠시 쉬는 시간입니다. 손가락은 카메라 위에 그대로 두세요.</span><br><br>다음 블록 안내<br>`
+      : "";
+    $("taskMsg").innerHTML = `${head}${guide}<br><span style="font-size:42px">${k}</span>`;
     setHeight();
     if (k-- > 0) { later(tickDown, 1000); return; }
     $("taskMsg").textContent = ""; $("fix").classList.remove("hidden");
@@ -1274,9 +1316,34 @@ function blockDone(bi) {
   cur = null;
   const blk = blocksOut[bi];
   if (blk.cond === "1back") blk.trials = trials.map(t => ({ s: t.s, r: t.r, rt: t.rt === null ? null : +t.rt.toFixed(1) }));
-  if (bi + 1 < order.length) { runBlock(bi + 1); return; }
-  finishSession();
+  askLoad(blk.cond, (score) => {
+    blk.load = score;
+    if (bi + 1 < order.length) { showView("task"); runBlock(bi + 1); return; }
+    finishSession();
+  });
 }
+
+// ---- 인지부하 점수 (0~10). 슬라이더를 한 번은 움직여야 [확인] 가능 (기본값 5가 그대로 기록되는 것 방지) ----
+function askLoad(cond, done) {
+  rateDone = done; rateTouched = false;
+  $("rateTitle").innerHTML = `방금 <b>${LABEL[cond]}</b> 블록에서 느낀<br><b>인지부하</b>는 어느 정도였나요?`;
+  $("rateSlider").value = 5;
+  $("rateValue").textContent = "–"; $("rateValue").classList.remove("set");
+  $("rateBtn").disabled = true;
+  showView("rate");
+}
+function onRate() {
+  rateTouched = true;
+  $("rateValue").textContent = $("rateSlider").value; $("rateValue").classList.add("set");
+  $("rateBtn").disabled = false;
+}
+$("rateSlider").addEventListener("input", onRate);
+$("rateSlider").addEventListener("change", onRate);
+$("rateBtn").addEventListener("click", () => {
+  if (!rateTouched || !rateDone) return;
+  const f = rateDone; rateDone = null;
+  f(parseInt($("rateSlider").value, 10));
+});
 
 function finishSession() {
   timers.forEach(clearTimeout); timers = [];
@@ -1298,6 +1365,7 @@ function renderResult(r) {
   for (const h of ["", "휴식", "1-back"]) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
   const rows = [
     ["진행 순서", r.order.map(c => LABEL[c]).join(" → "), ""],
+    ["인지부하 (0-10)", fmt(R.load), fmt(B.load)],
     ["검출된 IBI", fmt(R.beats, "개"), fmt(B.beats, "개")],
     ["평균 심박", fmt(R.hr_bpm, " bpm"), fmt(B.hr_bpm, " bpm")],
     ["평균 IBI", fmt(R.mean_ibi_ms, " ms"), fmt(B.mean_ibi_ms, " ms")],
@@ -1428,10 +1496,9 @@ def chain_page():
         return
     import pandas as pd
     raw, blocks, beats = parsed['raw'], parsed['blocks'], parsed['beats']
-    m = st.columns(3)
-    m[0].metric("전체 기록", len(raw))
-    m[1].metric("PPG 측정", len({(b['measurement_id'], b['participant_id']) for b in blocks}))
-    m[2].metric("참가자", len({b['participant_id'] for b in blocks}))
+    m = st.columns(2)
+    m[0].metric("PPG 측정", len({(b['measurement_id'], b['participant_id']) for b in blocks}))
+    m[1].metric("참가자", len({b['participant_id'] for b in blocks}))
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
     try:
         xlsx = excel_bytes(parsed)
@@ -1440,7 +1507,7 @@ def chain_page():
     if xlsx is not None:
         st.download_button("📥 엑셀로 내려받기 (.xlsx)", xlsx, f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
-        st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문)")
+        st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문). 시각은 한국 시간(KST).")
     else:
         # openpyxl이 없으면(requirements.txt 누락) 같은 내용을 CSV 3개로 제공
         st.warning("서버에 openpyxl이 설치되지 않아 엑셀 파일을 만들 수 없습니다. "
@@ -1459,18 +1526,14 @@ def chain_page():
         if chosen:
             df = df[df['participant_id'].isin(chosen)]
         df['condition'] = df['condition'].map(COND_LABEL).fillna(df['condition'])
-        st.dataframe(df[['participant_id', 'measurement_id', 'condition', 'order', 'rec_start_utc', 'hr_bpm',
-                         'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms', 'beats_valid', 'beats_excluded', 'nback_hit',
-                         'nback_miss', 'nback_false_alarm', 'nback_mean_rt_ms', 'block_time_utc', 'schema']],
-                     hide_index=True)
+        view = df[['participant_id', 'measurement_id', 'condition', 'order', 'rec_start_kst', 'cognitive_load',
+                   'hr_bpm', 'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms', 'beats_valid', 'beats_excluded', 'nback_hit',
+                   'nback_miss', 'nback_false_alarm', 'nback_mean_rt_ms', 'block_time_kst', 'schema']]
+        view = view.assign(cognitive_load=view['cognitive_load'].astype('Int64'))   # 이전 기록은 빈칸, 나머지는 정수
+        st.dataframe(view.rename(columns={'rec_start_kst': '기록 시작 (KST)', 'block_time_kst': '블록 시각 (KST)',
+                                          'cognitive_load': '인지부하'}), hide_index=True)
     else:
         st.caption("PPG 기록이 없습니다.")
-
-    st.subheader("전체 기록 (원문)")
-    if raw:
-        st.dataframe(pd.DataFrame(raw)[['index', 'block_time_utc', 'schema', 'title', 'sender', 'text']], hide_index=True)
-    else:
-        st.caption("컨트랙트에 기록이 없습니다.")
 
 
 def phone_page():
@@ -1497,7 +1560,7 @@ def phone_panel(pid: str, trial_ms: int):
         run_id=state.get('run_id', ''), ack=state.get('ack', 0.0), quality=state.get('quality', 'warming'),
         error=state.get('error', ''), preview=state.get('preview'), result=state.get('result_public'),
         result_error=state.get('result_error'), saved=state.get('saved'),
-        trial_ms=trial_ms, n_pre=N_PRE, n_rec=N_REC, n_post=N_POST, stim_ms=STIM_MS, break_s=BREAK_S,
+        trial_ms=trial_ms, n_pre=N_PRE, n_rec=N_REC, n_post=N_POST, stim_ms=STIM_MS, break_s=BREAK_S, gap_s=GAP_S,
         key=f'ppg_{pid}', default=None)
 
     if isinstance(value, dict) and (value.get('run_id'), value.get('seq')) != state.get('last'):
@@ -1603,7 +1666,8 @@ def monitor_page():
         return
     import pandas as pd
     rows = [{'참가자': r['participant_id'], '측정': r['task_id'][:8], '조건': COND_LABEL[b['condition']],
-             '순서': b['order'], '기록 시작(UTC)': b['rec_start_utc'][11:19], 'HR': b['hr_bpm'],
+             '순서': b['order'], '기록 시작(KST)': to_kst(b['rec_start_utc'])[11:19], '부하': b['load'],
+             'HR': b['hr_bpm'],
              'IBI': b['mean_ibi_ms'], 'SDNN': b['sdnn_ms'], 'RMSSD': b['rmssd_ms'], '박동': b['beats'],
              '커버리지': b['coverage'],
              '1-back 정확도': b['nback']['accuracy'] if 'nback' in b else None,
