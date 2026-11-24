@@ -781,7 +781,16 @@ def phone_page():
     except ValueError as exc:
         st.error(str(exc))
         return
+    # 체크박스는 항상 컴포넌트보다 위에 두어, 켜고 꺼도 측정 컴포넌트가 다시 만들어지지 않게 한다
+    show_results = st.checkbox(
+        "측정 결과 함께 보기", value=False,
+        help="본 실험에서는 끄세요. 참가자가 자기 심박을 보면 바이오피드백으로 상태가 바뀔 수 있습니다.")
     phone_panel(pid)
+    if show_results:
+        st.divider()
+        live_panel(pid)
+        block_controls(pid)
+        blocks_panel(pid)
 
 
 @st.fragment
@@ -804,21 +813,50 @@ def phone_panel(pid: str):
         state['error'] = str(exc)
 
 
-def monitor_page():
-    st.title("📈 PPG 실험자 모니터")
+def experimenter_login(key: str) -> bool:
+    """실험자 로그인 여부. 로그인 안 되어 있으면 비밀번호 입력창을 표시."""
+    if st.session_state.get('experimenter') is True:
+        return True
     password = config('MONITOR_PASSWORD')
     if not password:
         st.error("secrets 또는 환경변수에 MONITOR_PASSWORD를 설정하세요.")
-        return
-    if st.session_state.get('experimenter') is not True:
-        entered = st.text_input("비밀번호", type="password")
-        if entered:
-            if secrets.compare_digest(entered, password):
-                st.session_state['experimenter'] = True
-                st.rerun()
-            else:
-                time.sleep(1)
-                st.error("비밀번호가 틀렸습니다.")
+        return False
+    entered = st.text_input("실험자 비밀번호", type="password", key=f'pw_{key}')
+    if entered:
+        if secrets.compare_digest(entered, password):
+            st.session_state['experimenter'] = True
+            st.rerun()
+        else:
+            time.sleep(1)
+            st.error("비밀번호가 틀렸습니다.")
+    return False
+
+
+def block_controls(pid: str):
+    store = get_store()
+    st.subheader("블록")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    condition = c1.text_input("조건", placeholder="baseline / defensive / aggressive / load_only / load_anxiety ...",
+                              label_visibility="collapsed", key=f'cond_{pid}')
+    if c2.button("▶ 블록 시작", key=f'bstart_{pid}'):
+        try:
+            store.start_block(pid, condition)
+            st.toast(f"블록 시작: {condition}")
+        except ValueError as exc:
+            st.error(str(exc))
+    if c3.button("■ 블록 종료", key=f'bstop_{pid}'):
+        try:
+            s = store.stop_block(pid)
+            st.toast(f"블록 종료: {s['condition']} ({s['duration_s']}초)")
+            if s['error']:
+                st.warning(s['error'])
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def monitor_page():
+    st.title("📈 PPG 실험자 모니터")
+    if not experimenter_login('monitor'):
         return
 
     store = get_store()
@@ -833,26 +871,7 @@ def monitor_page():
     pid = top[0].selectbox("참가자", list(labels), format_func=labels.get)
 
     live_panel(pid)
-
-    st.subheader("블록")
-    c1, c2, c3 = st.columns([2, 1, 1])
-    condition = c1.text_input("조건", placeholder="baseline / defensive / aggressive / load_only / load_anxiety ...",
-                              label_visibility="collapsed")
-    if c2.button("▶ 블록 시작"):
-        try:
-            store.start_block(pid, condition)
-            st.toast(f"블록 시작: {condition}")
-        except ValueError as exc:
-            st.error(str(exc))
-    if c3.button("■ 블록 종료"):
-        try:
-            s = store.stop_block(pid)
-            st.toast(f"블록 종료: {s['condition']} ({s['duration_s']}초)")
-            if s['error']:
-                st.warning(s['error'])
-        except ValueError as exc:
-            st.error(str(exc))
-
+    block_controls(pid)
     blocks_panel(pid)
 
 
@@ -862,7 +881,7 @@ def live_panel(pid: str):
     import pandas as pd
     live = get_store().live(pid)
     if live is None:
-        st.warning("세션이 없습니다.")
+        st.info("측정을 시작하면 여기에 결과가 표시됩니다.")
         return
     res = live['res']
     m = st.columns(5)
@@ -919,7 +938,12 @@ def blocks_panel(pid: str):
         st.dataframe(pd.DataFrame(blocks)[cols], hide_index=True)
 
         pending = [b for b in blocks if not b['tx_id'] and b['hr_bpm'] is not None]
-        if pending:
+        is_experimenter = st.session_state.get('experimenter') is True
+        if pending and not is_experimenter:
+            # 블록체인 등록은 수수료 지갑을 쓰므로 실험자만 가능
+            with st.expander("🔗 블록체인 등록 (실험자 로그인 필요)"):
+                experimenter_login(f'reg_{pid}')
+        if pending and is_experimenter:
             c1, c2 = st.columns([3, 1])
             chosen = c1.selectbox("블록체인에 등록할 블록", pending,
                                   format_func=lambda b: f"{b['condition']} · {b['started_at_utc'][11:19]} UTC · HR {b['hr_bpm']}")
@@ -939,11 +963,14 @@ def blocks_panel(pid: str):
                 except (NodeError, ValueError) as exc:
                     st.error(str(exc))
 
+    if pid not in store.sessions:
+        return
     st.caption("앱이 재시작되면 메모리의 데이터가 사라집니다. 세션이 끝나면 내려받으세요.")
     d1, d2, d3 = st.columns(3)
-    d1.download_button("원시 신호 CSV", store.csv_raw(pid), f"{pid}_raw.csv", "text/csv")
-    d2.download_button("블록별 IBI CSV", store.csv_ibi(pid), f"{pid}_ibi.csv", "text/csv")
-    d3.download_button("전체 블록 요약 CSV", store.csv_blocks(), "blocks.csv", "text/csv")
+    d1.download_button("원시 신호 CSV", store.csv_raw(pid), f"{pid}_raw.csv", "text/csv", key=f'dl_raw_{pid}')
+    d2.download_button("블록별 IBI CSV", store.csv_ibi(pid), f"{pid}_ibi.csv", "text/csv", key=f'dl_ibi_{pid}')
+    if st.session_state.get('experimenter') is True:   # 다른 참가자 데이터가 섞여 있으므로 실험자만
+        d3.download_button("전체 블록 요약 CSV", store.csv_blocks(), "blocks.csv", "text/csv", key='dl_blocks')
 
 
 def main():
