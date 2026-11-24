@@ -4,6 +4,7 @@
 
   참가자 폰:   https://<앱 주소>/                 (Streamlit Cloud는 HTTPS 자동 제공)
   실험자 PC:   https://<앱 주소>/?page=monitor    (선택, MONITOR_PASSWORD 필요)
+  언어:        화면 맨 위에서 English / 한국어 선택 (기본 English). 주소에 ?lang=ko 를 붙이면 한국어로 시작
 
 흐름 (폰 한 화면)
   1) [측정 준비]  카메라+플래시 ON → PPG 파형과 검출된 박동, IBI 그래프를 1초마다 갱신해 신호 확인
@@ -88,7 +89,7 @@ TITLE = 'PPG'
 COND_KEY = {'rest': 'r', '1back': 'b'}       # 기록 안에서 쓰는 짧은 블록 키
 KEY_COND = {v: k for k, v in COND_KEY.items()}
 CONDITIONS = ('rest', '1back')
-COND_LABEL = {'rest': '휴식', '1back': '1-back'}
+COND_LABELS = {'en': {'rest': 'Rest', '1back': '1-back'}, 'ko': {'rest': '휴식', '1back': '1-back'}}
 MAX_TX_DATA_BYTES = 526
 
 # 블록 구성 (숫자 칸 수, 휴식 블록도 같은 길이)
@@ -103,8 +104,66 @@ KST = timezone(timedelta(hours=9))  # 화면 표시용 한국 시간
 
 # 화면 상단 메뉴 아이콘/이름. 아이콘은 이모지 또는 Streamlit 머티리얼 아이콘(:material/이름:)
 #   다른 후보: ':material/ecg_heart:', ':material/cardiology:', '🫀', '💓'
-MEASURE_ICON, MEASURE_NAME = ':material/monitor_heart:', '심박 측정'
-CHAIN_ICON, CHAIN_NAME = '⛓️', '데이터 보기'
+MEASURE_ICON, MEASURE_NAMES = ':material/monitor_heart:', {'en': 'Heart Rate', 'ko': '심박 측정'}
+CHAIN_ICON, CHAIN_NAMES = '⛓️', {'en': 'View Data', 'ko': '데이터 보기'}
+
+# ---- 언어 (영어 기본, 화면 위에서 선택 · 주소에 ?lang=ko 로 한국어 시작) ----
+LANGS = {'en': 'English', 'ko': '한국어'}
+DEFAULT_LANG = 'en'
+
+
+def lang() -> str:
+    try:
+        v = st.session_state.get('lang', DEFAULT_LANG)
+    except Exception:
+        v = DEFAULT_LANG
+    return v if v in LANGS else DEFAULT_LANG
+
+
+def tr(en: str, ko: str) -> str:
+    """현재 언어의 문구."""
+    return ko if lang() == 'ko' else en
+
+
+def bi(en: str, ko: str) -> dict:
+    """두 언어를 함께 저장할 문구 (결과 경고처럼 나중에 다른 언어로 보여 줄 수 있는 것)."""
+    return {'en': en, 'ko': ko}
+
+
+def bi_text(v) -> str:
+    if isinstance(v, dict):
+        return v.get(lang()) or v.get('en', '')
+    return v or ''
+
+
+def cond_label(cond: str) -> str:
+    return COND_LABELS[lang()].get(cond, cond)
+
+
+def measure_name() -> str:
+    return MEASURE_NAMES[lang()]
+
+
+def chain_name() -> str:
+    return CHAIN_NAMES[lang()]
+
+
+class LocalizedError(Exception):
+    """영어/한국어 메시지를 함께 가진 예외. 화면에서는 err_text()로 현재 언어를 고른다."""
+    def __init__(self, en: str, ko: str | None = None):
+        super().__init__(en)
+        self.en, self.ko = en, ko or en
+
+    def text(self, lang_code: str) -> str:
+        return self.ko if lang_code == 'ko' else self.en
+
+
+class DataError(LocalizedError, ValueError):
+    """입력/측정 데이터 오류 (ValueError로도 잡힌다)."""
+
+
+def err_text(exc: Exception) -> str:
+    return exc.text(lang()) if isinstance(exc, LocalizedError) else str(exc)
 
 FS = 30.0
 GAP_MS = 400.0
@@ -130,7 +189,7 @@ def utc_iso(ms: float) -> str:
 def validate_pid(value) -> str:
     pid = str(value or '').strip().upper()
     if not PARTICIPANT_RE.fullmatch(pid) or int(pid[1:]) == 0:
-        raise ValueError('참가자 코드는 P01~P999 형식이어야 합니다.')
+        raise DataError('Participant code must be P01–P999.', '참가자 코드는 P01~P999 형식이어야 합니다.')
     return pid
 
 
@@ -290,7 +349,7 @@ def score_nback(trials: list[dict], n: int = 1) -> dict:
 # ============================================================
 # 2. 공용 저장소 (모든 Streamlit 세션이 공유)
 # ============================================================
-class IngestError(Exception):
+class IngestError(LocalizedError):
     pass
 
 
@@ -327,40 +386,40 @@ class Store:
 
     def ingest(self, pid: str, value: dict) -> dict:
         if not isinstance(value, dict):
-            raise IngestError('데이터 형식 오류')
+            raise IngestError('Invalid data format.', '데이터 형식 오류')
         run_id, sent_at = value.get('run_id'), value.get('sent_at')
         samples, running = value.get('samples'), value.get('running') is True
         server_now = now_ms()
         if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
-            raise IngestError('측정 ID 오류')
+            raise IngestError('Invalid measurement ID.', '측정 ID 오류')
         if not _num(sent_at) or abs(sent_at - server_now) > 86_400_000:
-            raise IngestError('폰 시계가 올바르지 않습니다.')
+            raise IngestError("The phone's clock is incorrect.", '폰 시계가 올바르지 않습니다.')
         if not isinstance(samples, list) or len(samples) > MAX_BATCH:
-            raise IngestError('샘플 형식 오류')
+            raise IngestError('Invalid sample format.', '샘플 형식 오류')
         parsed = []
         for s in samples:
             if not (isinstance(s, list) and len(s) == 3 and all(_num(v) for v in s)):
-                raise IngestError('샘플 값 오류')
+                raise IngestError('Invalid sample value.', '샘플 값 오류')
             t, r, g = map(float, s)
             if not (0 <= r <= 255 and 0 <= g <= 255) or abs(t - sent_at) > 300_000:
-                raise IngestError('샘플 값 범위 오류')
+                raise IngestError('Sample value out of range.', '샘플 값 범위 오류')
             parsed.append((t, r, g))
 
         with self.lock:
             sess = self.sessions.get(pid)
             if sess is None:
                 if len(self.sessions) >= MAX_SESSIONS:
-                    raise IngestError('동시 측정 세션 수를 초과했습니다.')
+                    raise IngestError('Too many simultaneous measurement sessions.', '동시 측정 세션 수를 초과했습니다.')
                 sess = self.sessions[pid] = PPGSession(pid)
             if run_id != sess.run_id:
                 if run_id in sess.old_runs:
-                    raise IngestError('다른 기기(또는 새 측정)에서 같은 참가자 코드로 측정이 시작되어 이 측정은 중단되었습니다.')
+                    raise IngestError('A measurement with the same participant code was started on another device (or a new measurement was started), so this one was stopped.', '다른 기기(또는 새 측정)에서 같은 참가자 코드로 측정이 시작되어 이 측정은 중단되었습니다.')
                 if sess.run_id:
                     sess.old_runs.add(sess.run_id)
                 sess.run_id, sess.ack, sess.run_start_idx = run_id, 0.0, len(sess.t)
                 sess.offsets.clear()
             if len(sess.t) + len(parsed) > MAX_SESSION_SAMPLES:
-                raise IngestError('세션 최대 길이를 초과했습니다. 새 참가자 코드로 시작하세요.')
+                raise IngestError('Maximum session length exceeded. Start with a new participant code.', '세션 최대 길이를 초과했습니다. 새 참가자 코드로 시작하세요.')
             sess.offsets.append(server_now - float(sent_at))
             offset = sess.offset_ms
             last_t = sess.t[-1] if sess.t else -math.inf
@@ -420,55 +479,55 @@ class Store:
         """두 블록 각각의 기록 구간(폰 시계) IBI + 1-back 성적. 데이터가 아직 다 안 왔으면 None."""
         task_id = task.get('task_id')
         if not isinstance(task_id, str) or not RUN_ID_RE.fullmatch(task_id):
-            raise ValueError('측정 ID 오류')
+            raise DataError('Invalid measurement ID.', '측정 ID 오류')
         trial_ms = task.get('trial_ms')
         if not _num(trial_ms) or not 1000 <= trial_ms <= 6000:
-            raise ValueError('숫자 간격 값 오류')
+            raise DataError('Invalid digit interval.', '숫자 간격 값 오류')
         trial_ms = int(trial_ms)
         order = task.get('order')
         if not isinstance(order, list) or sorted(order) != sorted(CONDITIONS):
-            raise ValueError('블록 순서 값 오류')
+            raise DataError('Invalid block order.', '블록 순서 값 오류')
         raw_blocks = task.get('blocks')
         if not isinstance(raw_blocks, list) or len(raw_blocks) != len(order):
-            raise ValueError('블록 데이터 오류')
+            raise DataError('Invalid block data.', '블록 데이터 오류')
 
         blocks, prev_end = [], -math.inf
         for i, (cond, b) in enumerate(zip(order, raw_blocks)):
             if not isinstance(b, dict) or b.get('cond') != cond:
-                raise ValueError('블록 순서가 맞지 않습니다.')
+                raise DataError('Block order does not match.', '블록 순서가 맞지 않습니다.')
             times = [b.get(k) for k in ('start_tp', 'rec_start_tp', 'rec_end_tp', 'end_tp')]
             if not all(_num(v) for v in times):
-                raise ValueError('블록 시각 값 오류')
+                raise DataError('Invalid block times.', '블록 시각 값 오류')
             start, rec_start, rec_end, end = map(float, times)
             expected = (N_PRE * trial_ms, N_REC * trial_ms, N_POST * trial_ms)
             actual = (rec_start - start, rec_end - rec_start, end - rec_end)
             if any(abs(a - e) > 5 for a, e in zip(actual, expected)) or start < prev_end:
-                raise ValueError('블록 구간 시각이 설정과 맞지 않습니다.')
+                raise DataError('Block timing does not match the settings.', '블록 구간 시각이 설정과 맞지 않습니다.')
             prev_end = end
             trials = None
             if cond == '1back':
                 raw_trials = b.get('trials')
                 if not isinstance(raw_trials, list) or len(raw_trials) != N_TOTAL:
-                    raise ValueError('1-back 시행 데이터 오류')
+                    raise DataError('Invalid 1-back trial data.', '1-back 시행 데이터 오류')
                 trials = []
                 for t in raw_trials:
                     sv = str(t.get('s', '')) if isinstance(t, dict) else ''
                     if len(sv) != 1 or sv not in '123456789':
-                        raise ValueError('1-back 자극 값 오류')
+                        raise DataError('Invalid 1-back stimulus.', '1-back 자극 값 오류')
                     responded = t.get('r') is True
                     rt = t.get('rt')
                     rt = round(float(rt), 1) if responded and _num(rt) and 0 <= rt <= 6000 else None
                     trials.append({'s': sv, 'r': responded, 'rt': rt})
             load = b.get('load')
             if isinstance(load, bool) or not isinstance(load, int) or not 0 <= load <= 10:
-                raise ValueError('인지부하 점수(0~10)가 없습니다.')
+                raise DataError('Cognitive load rating (0–10) is missing.', '인지부하 점수(0~10)가 없습니다.')
             blocks.append({'cond': cond, 'order': i + 1, 'start': start, 'rec_start': rec_start,
                            'rec_end': rec_end, 'end': end, 'trials': trials, 'load': load})
 
         with self.lock:
             sess = self.sessions.get(pid)
             if sess is None or sess.run_id != run_id:
-                raise ValueError('측정 세션이 바뀌었습니다. 다시 측정하세요.')
+                raise DataError('The measurement session changed. Please measure again.', '측정 세션이 바뀌었습니다. 다시 측정하세요.')
             done = next((r for r in sess.results if r.get('task_id') == task_id), None)
             if done:
                 return done
@@ -503,7 +562,7 @@ class Store:
         mask = (tp >= rec_start - 20_000) & (tp <= b['end'] + 2000)   # 필터 안정화를 위해 앞부분 포함
         res = analyze(tp[mask], r[mask], g[mask]) if mask.sum() > 1 else None
         if res is None:
-            out['warning'] = '신호가 부족해 IBI를 계산하지 못했습니다.'
+            out['warning'] = bi('Not enough signal to compute IBIs.', '신호가 부족해 IBI를 계산하지 못했습니다.')
             return out
         pk = res['peak_ms']
         sel = (pk[:-1] >= rec_start) & (pk[1:] <= rec_end)
@@ -519,7 +578,9 @@ class Store:
             'coverage': round(coverage, 3), 'quality': round(res['quality'], 3),
         })
         if coverage < 0.8:
-            out['warning'] = f'기록 구간의 {round((1 - coverage) * 100)}%에서 박동을 신뢰성 있게 검출하지 못했습니다.'
+            pct = round((1 - coverage) * 100)
+            out['warning'] = bi(f'Beats could not be detected reliably in {pct}% of the recording window.',
+                                f'기록 구간의 {pct}%에서 박동을 신뢰성 있게 검출하지 못했습니다.')
         return out
 
     def get_result(self, pid: str, task_id: str) -> dict | None:
@@ -577,7 +638,7 @@ def csv_summary(results: list[dict]) -> bytes:
                      + ['nback_' + k for k in nb] + ['tx_id', 'warning'],
                      ([r['participant_id'], r['task_id'], b['condition'], b['order'], r['trial_ms']]
                       + [b[c] for c in cols] + [b['nback'][k] if 'nback' in b else '' for k in nb]
-                      + [r['tx_id'], b['warning']] for r, b in _blocks(results)))
+                      + [r['tx_id'], bi_text(b['warning'])] for r, b in _blocks(results)))
 
 
 def csv_ibi(results: list[dict]) -> bytes:
@@ -620,7 +681,7 @@ def get_store() -> Store:
 # ============================================================
 # 3. XperChain 저장
 # ============================================================
-class NodeError(Exception):
+class NodeError(LocalizedError):
     pass
 
 
@@ -630,20 +691,22 @@ def node_request(method: str, path: str, **kwargs) -> dict:
         try:
             data = response.json()
         except ValueError as exc:
-            raise NodeError(f'XperChain이 {method} {path}에 JSON 대신 HTTP {response.status_code}를 반환했습니다.') from exc
+            raise NodeError(f'XperChain returned HTTP {response.status_code} instead of JSON for {method} {path}.',
+                            f'XperChain이 {method} {path}에 JSON 대신 HTTP {response.status_code}를 반환했습니다.') from exc
         if not isinstance(data, dict):
-            raise NodeError('XperChain이 예상치 못한 응답을 반환했습니다.')
+            raise NodeError('XperChain returned an unexpected response.', 'XperChain이 예상치 못한 응답을 반환했습니다.')
         if response.status_code >= 400 or not data.get('ok', True):
-            raise NodeError(f"노드가 요청을 거부했습니다: {data.get('error') or response.status_code}")
+            reason = data.get('error') or response.status_code
+            raise NodeError(f'The node rejected the request: {reason}', f'노드가 요청을 거부했습니다: {reason}')
         return data
     except requests.RequestException as exc:
-        raise NodeError('XperChain 노드에 연결할 수 없습니다.') from exc
+        raise NodeError('Cannot connect to the XperChain node.', 'XperChain 노드에 연결할 수 없습니다.') from exc
 
 
 def service_signing_key() -> Ed25519PrivateKey:
     value = config('RATING_WALLET_PRIVATE_KEY_HEX')
     if not re.fullmatch(r'[0-9a-fA-F]{64}', value):
-        raise NodeError('RATING_WALLET_PRIVATE_KEY_HEX(64자리 hex)가 설정되지 않았습니다.')
+        raise NodeError('RATING_WALLET_PRIVATE_KEY_HEX (64 hex characters) is not set.', 'RATING_WALLET_PRIVATE_KEY_HEX(64자리 hex)가 설정되지 않았습니다.')
     return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(value))
 
 
@@ -700,7 +763,7 @@ def decode_ibis(text: str, max_beats: int = 2000) -> list[int]:
         n, shift = 0, 0
         while True:
             if i >= len(data) or shift > 28:
-                raise ValueError('IBI 데이터가 손상되었습니다.')
+                raise DataError('IBI data is corrupted.', 'IBI 데이터가 손상되었습니다.')
             b = data[i]; i += 1
             n |= (b & 0x7F) << shift
             shift += 7
@@ -709,7 +772,7 @@ def decode_ibis(text: str, max_beats: int = 2000) -> list[int]:
         v = n if prev is None else prev + (n // 2 if n % 2 == 0 else -(n + 1) // 2)
         values.append(v); prev = v
         if len(values) > max_beats:
-            raise ValueError('IBI 개수가 너무 많습니다.')
+            raise DataError('Too many IBIs.', 'IBI 개수가 너무 많습니다.')
     return values
 
 
@@ -748,16 +811,16 @@ def record_size(result: dict) -> int:
 def chain_texts() -> list[str]:
     """컨트랙트 상태(확정)와 mempool(대기)의 upload_text 내용."""
     if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
-        raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
+        raise NodeError('XPER_CONTRACT_ADDRESS is invalid.', 'XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
     if node_request('GET', '/status').get('is_synced') is not True:
-        raise NodeError('노드가 아직 동기화 중입니다.')
+        raise NodeError('The node is still synchronizing.', '노드가 아직 동기화 중입니다.')
     snap = node_request('GET', f'/contract/{CONTRACT_ADDR}')
     try:
         meta = json.loads((snap.get('contract') or {}).get('code', '{}'))
     except (TypeError, ValueError) as exc:
-        raise NodeError('컨트랙트 메타데이터를 읽을 수 없습니다.') from exc
+        raise NodeError('Cannot read the contract metadata.', '컨트랙트 메타데이터를 읽을 수 없습니다.') from exc
     if meta.get('template') != 'logbook_v1' or 'upload_text' not in meta.get('methods', []):
-        raise NodeError('upload_text를 지원하는 logbook_v1 컨트랙트가 아닙니다.')
+        raise NodeError('The contract is not a logbook_v1 contract with upload_text.', 'upload_text를 지원하는 logbook_v1 컨트랙트가 아닙니다.')
     texts = [i.get('text', '') for i in (snap.get('state') or {}).get('data_items', []) if isinstance(i, dict)]
     for tx in node_request('GET', '/mempool').get('mempool', []):
         if isinstance(tx, dict) and tx.get('tx_type') == 'CONTRACT_CALL':
@@ -781,23 +844,23 @@ def used_mids() -> set[str]:
 
 def save_to_blockchain(store: Store, result: dict) -> str:
     if all(b['hr_bpm'] is None for b in result['blocks'].values()):
-        raise NodeError('IBI 결과가 없는 측정은 저장할 수 없습니다.')
+        raise NodeError('A measurement without IBI results cannot be saved.', 'IBI 결과가 없는 측정은 저장할 수 없습니다.')
     if result.get('tx_id'):
-        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
+        raise NodeError('This measurement has already been submitted to the blockchain.', '이 측정은 이미 블록체인에 저장 요청되었습니다.')
     allowed = config('ALLOWED_PARTICIPANT_CODES')
     if allowed and result['participant_id'] not in {v.strip().upper() for v in allowed.split(',')}:
-        raise NodeError('이 참가자 코드는 저장이 허용되지 않았습니다.')
+        raise NodeError('This participant code is not allowed to save.', '이 참가자 코드는 저장이 허용되지 않았습니다.')
     record = build_record(result)
     tx_data = build_tx_data(record)
     size = tx_data_size(tx_data)
     if size > MAX_TX_DATA_BYTES:
-        raise NodeError(f'기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘습니다. '
-                        '다시 측정하세요.')
+        raise NodeError(f'Record size {size} bytes exceeds the node limit of {MAX_TX_DATA_BYTES} bytes. Please measure again.',
+                        f'기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘습니다. 다시 측정하세요.')
     key = service_signing_key()
     wallet, public = wallet_address(key)
     with store.submit_lock:
         if record['mid'] in used_mids():
-            raise NodeError('이 측정은 이미 블록체인에 저장(또는 대기)되어 있습니다.')
+            raise NodeError('This measurement is already on the blockchain (or pending).', '이 측정은 이미 블록체인에 저장(또는 대기)되어 있습니다.')
         nonce = node_request('GET', f'/account/{wallet}/nonce')
         fee = node_request('POST', '/fee/estimate', json={'tx_type': 'CONTRACT_CALL', 'data': tx_data})
         tx = {'sender': wallet, 'recipient': CONTRACT_ADDR, 'amount_xbit': 0,
@@ -811,7 +874,7 @@ def save_to_blockchain(store: Store, result: dict) -> str:
             'fee_xbit': tx['fee_xbit'], 'nonce': tx['nonce'], 'timestamp': tx['timestamp']})
     tx_id = str(res.get('tx_id', ''))
     if not TX_ID_RE.fullmatch(tx_id):
-        raise NodeError('노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
+        raise NodeError('The node did not return a valid transaction ID.', '노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
     store.set_tx(result['participant_id'], result['task_id'], tx_id)
     return tx_id
 
@@ -819,7 +882,7 @@ def save_to_blockchain(store: Store, result: dict) -> str:
 # ---- 데이터 보기: 컨트랙트 전체 기록 읽기 / 해석 / 엑셀 ----
 def fetch_contract_items() -> list[dict]:
     if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
-        raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
+        raise NodeError('XPER_CONTRACT_ADDRESS is invalid.', 'XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
     snap = node_request('GET', f'/contract/{CONTRACT_ADDR}')
     items = (snap.get('state') or {}).get('data_items', [])
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
@@ -859,7 +922,7 @@ def _safe_cell(v):
 
 def _check_ibis(ibi) -> list[int]:
     if any(not isinstance(v, int) or not 200 <= v <= 3000 for v in ibi):
-        raise ValueError('IBI 값 범위 오류 (손상되었거나 다른 형식의 기록)')
+        raise DataError('IBI value out of range (corrupted or a different format).', 'IBI 값 범위 오류 (손상되었거나 다른 형식의 기록)')
     return ibi
 
 
@@ -944,7 +1007,7 @@ def _add_block(blocks, beats, item, schema, mid, pid, cond, order, t, trial_ms, 
 def rows_csv(rows: list[dict]) -> bytes:
     """엑셀 대신 쓰는 CSV. 체인의 문자열은 신뢰할 수 없으므로 수식으로 해석될 셀은 ' 를 붙인다."""
     if not rows:
-        return csv_bytes(['(없음)'], [])
+        return csv_bytes([tr('(none)', '(없음)')], [])
     header = list(rows[0])
     def cell(v):
         return "'" + v if isinstance(v, str) and v[:1] in ('=', '+', '-', '@', '\t', '\r') else v
@@ -956,8 +1019,10 @@ def excel_bytes(parsed: dict) -> bytes:
     import pandas as pd
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as xw:
-        for name, rows in (('PPG 요약', parsed['blocks']), ('PPG IBI', parsed['beats']), ('전체 기록', parsed['raw'])):
-            df = pd.DataFrame(rows) if rows else pd.DataFrame({'(없음)': []})
+        sheets = ((tr('PPG summary', 'PPG 요약'), parsed['blocks']), ('PPG IBI', parsed['beats']),
+                  (tr('All records', '전체 기록'), parsed['raw']))
+        for name, rows in sheets:
+            df = pd.DataFrame(rows) if rows else pd.DataFrame({tr('(none)', '(없음)'): []})
             df = df.apply(lambda col: col if pd.api.types.is_numeric_dtype(col) else col.map(_safe_cell))
             df.to_excel(xw, sheet_name=name, index=False)
             ws = xw.sheets[name]
@@ -976,7 +1041,7 @@ def excel_bytes(parsed: dict) -> bytes:
 # 4. 폰 컴포넌트 (카메라 PPG + 1-back)
 # ============================================================
 COMPONENT_HTML = r"""<!DOCTYPE html>
-<html lang="ko"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <style>
   * { box-sizing:border-box; }
   body { margin:0; font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;
@@ -1018,21 +1083,21 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
 </style></head>
 <body><div class="wrap">
   <div id="v-idle">
-    <div class="hint">왼손으로 스마트폰을 잡고 왼손 검지로 <b>후면 카메라를</b> 가볍게 덮어 주세요.</div>
-    <button id="prepBtn">측정 준비</button>
+    <div class="hint" data-i18n="idle_hint"></div>
+    <button id="prepBtn" data-i18n="prep_btn"></button>
   </div>
 
   <div id="v-prep" class="hidden">
-    <div class="row"><span id="qdot" class="dot"></span><span id="qmsg">신호 확인 중...</span></div>
-    <div class="label">PPG 신호 (최근 10초 · 빨간 점 = 검출된 박동)</div>
+    <div class="row"><span id="qdot" class="dot"></span><span id="qmsg"></span></div>
+    <div class="label" data-i18n="wave_label"></div>
     <canvas id="cWave" height="140"></canvas>
-    <div class="label">IBI (최근 60초) <span id="hrText"></span></div>
+    <div class="label"><span data-i18n="ibi_label"></span> <span id="hrText"></span></div>
     <canvas id="cIbi" height="120"></canvas>
-    <div class="hint">박동마다 빨간 점이 하나씩 찍히고 IBI 점이 고르게 이어지면 [측정 시작]을 누르세요.</div>
+    <div class="hint" data-i18n="prep_hint"></div>
     <div class="hint" id="torchNote"></div>
-    <div class="hint">측정은 <b>휴식</b>과 <b>1-back</b> 두 블록으로 진행되며, 순서는 무작위입니다.</div>
-    <button id="startBtn">측정 시작</button>
-    <button id="cancelBtn" class="secondary">취소</button>
+    <div class="hint" data-i18n="blocks_hint"></div>
+    <button id="startBtn" data-i18n="start_btn"></button>
+    <button id="cancelBtn" class="secondary" data-i18n="cancel_btn"></button>
   </div>
 
   <div id="v-task" class="hidden">
@@ -1041,7 +1106,7 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
     <div id="progress"></div>
     <div id="stimBox"><span id="stim"></span><span id="fix" class="hidden">+</span></div>
     <div id="taskMsg"></div>
-    <button id="matchBtn">일치</button>
+    <button id="matchBtn" data-i18n="match_btn"></button>
   </div>
 
   <div id="v-rate" class="hidden">
@@ -1049,19 +1114,19 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
     <div id="rateValue">–</div>
     <input id="rateSlider" type="range" min="0" max="10" step="1" value="5">
     <div class="ticks"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span></div>
-    <div class="scale"><span>전혀 부하 없음</span><span>매우 부하 높음</span></div>
-    <div class="hint">손가락은 카메라 위에 그대로 두고, 오른손으로 슬라이더를 움직여 주세요.</div>
-    <button id="rateBtn" disabled>확인</button>
+    <div class="scale"><span data-i18n="scale_low"></span><span data-i18n="scale_high"></span></div>
+    <div class="hint" data-i18n="rate_hint"></div>
+    <button id="rateBtn" disabled data-i18n="confirm"></button>
   </div>
 
   <div id="v-done" class="hidden">
-    <h3 id="doneTitle" style="margin:4px 0 8px">결과 계산 중...</h3>
+    <h3 id="doneTitle" style="margin:4px 0 8px"></h3>
     <div id="summary"></div>
     <div class="label" id="resLabel"></div>
     <canvas id="cRes" height="120" class="hidden"></canvas>
     <div class="warn" id="warn"></div>
     <div class="hint" id="saveHint"></div>
-    <button id="againBtn" class="secondary">다시 측정</button>
+    <button id="againBtn" class="secondary" data-i18n="again_btn"></button>
   </div>
   <div id="err"></div>
 </div>
@@ -1085,18 +1150,117 @@ let sendTimer = null, fallbackTimer = null, wakeLock = null, lastMediaTime = -1;
 let taskId = "", trialMs = 2500, nPre = 5, nRec = 10, nPost = 5, stimMs = 500;
 let digits = [], trials = [], cur = null, t0 = 0, timers = [], taskPayload = null, gotResult = false;
 let order = [], blocksOut = [], breakS = 5, gapS = 50, rateDone = null, rateTouched = false;
-const LABEL = { rest: "휴식", "1back": "1-back" };
+// ---- 영어 / 한국어 문구 (이 파일의 고정 문자열만 쓰므로 innerHTML 사용 가능) ----
+const I18N = {
+  en: {
+    idle_hint: "Hold the phone in your left hand and gently cover the <b>rear camera</b> with your left index finger.",
+    prep_btn: "Prepare", start_btn: "Start", cancel_btn: "Cancel", match_btn: "Match", confirm: "OK",
+    again_btn: "Measure again",
+    wave_label: "PPG signal (last 10 s · red dots = detected beats)", ibi_label: "IBI (last 60 s)",
+    prep_hint: "When each beat gets one red dot and the IBI points line up evenly, press [Start].",
+    blocks_hint: "The measurement has two blocks, <b>Rest</b> and <b>1-back</b>, in random order.",
+    scale_low: "No load at all", scale_high: "Very high load",
+    rate_hint: "Keep your finger on the camera and move the slider with your right hand.",
+    rest: "Rest", oneback: "1-back",
+    q_warming: "Checking signal... keep your index finger in contact with the camera",
+    q_good: "Good signal", q_fair: "Fair signal — keep your finger still",
+    q_poor: "Weak signal — gently place your finger again",
+    q_nofinger: "No finger detected — cover the camera and the flash together",
+    q_dark: "Too dark — check that the flash is on",
+    q_saturated: "Too bright — cover the camera completely with your finger",
+    computing: "Calculating results...", done: "Measurement complete", result_fail: "Could not calculate the results",
+    save_hint: "You can save the results with the [Save to blockchain] button below.",
+    saved: "Saved to the blockchain (1 transaction)",
+    no_camera: "The camera is not available in this browser.",
+    no_torch: "This browser cannot turn on the flash. On Android, use Chrome.",
+    cam_denied: "Please allow camera access.",
+    bg_warn: "The measurement stops if the screen turns off or you switch to another app.",
+    collecting: "Collecting data...", hr_now: "· about {hr} bpm now",
+    block_title: "Block {i} / {n} · {label}",
+    guide_rest: "<b>Rest</b><br>Look calmly at the + in the center of the screen.<br>Keep your finger still.",
+    guide_1back: "<b>1-back</b><br>Press [Match] when the digit is <b>the same as the one just before</b>.",
+    break_head: "Short break. Keep your finger on the camera.", next_block: "Next block",
+    sec_left: "{s} s left",
+    rate_title: "How much <b>cognitive load</b> did you feel<br>in the <b>{label}</b> block just now?",
+    r_order: "Order", r_load: "Cognitive load (0-10)", r_beats: "IBIs detected", r_hr: "Mean heart rate",
+    r_ibi: "Mean IBI", r_acc: "1-back accuracy", r_hitfa: "Hits / false alarms", r_rt: "Mean reaction time",
+    count: "{n}", hitfa: "{h}/{n} · {fa}",
+    res_label: "Recording-window IBI — blue: Rest, orange: 1-back (gray = excluded beats)",
+  },
+  ko: {
+    idle_hint: "왼손으로 스마트폰을 잡고 왼손 검지로 <b>후면 카메라를</b> 가볍게 덮어 주세요.",
+    prep_btn: "측정 준비", start_btn: "측정 시작", cancel_btn: "취소", match_btn: "일치", confirm: "확인",
+    again_btn: "다시 측정",
+    wave_label: "PPG 신호 (최근 10초 · 빨간 점 = 검출된 박동)", ibi_label: "IBI (최근 60초)",
+    prep_hint: "박동마다 빨간 점이 하나씩 찍히고 IBI 점이 고르게 이어지면 [측정 시작]을 누르세요.",
+    blocks_hint: "측정은 <b>휴식</b>과 <b>1-back</b> 두 블록으로 진행되며, 순서는 무작위입니다.",
+    scale_low: "전혀 부하 없음", scale_high: "매우 부하 높음",
+    rate_hint: "손가락은 카메라 위에 그대로 두고, 오른손으로 슬라이더를 움직여 주세요.",
+    rest: "휴식", oneback: "1-back",
+    q_warming: "신호 확인 중... 검지 손가락을 카메라와 접촉을 유지해주세요",
+    q_good: "신호 좋음", q_fair: "신호 보통 — 손가락을 움직이지 마세요",
+    q_poor: "신호 약함 — 손가락을 가볍게 다시 올려 주세요",
+    q_nofinger: "손가락이 감지되지 않습니다 — 카메라와 플래시를 함께 덮어 주세요",
+    q_dark: "너무 어둡습니다 — 플래시가 켜졌는지 확인하세요",
+    q_saturated: "너무 밝습니다 — 손가락으로 카메라를 완전히 덮어 주세요",
+    computing: "결과 계산 중...", done: "측정 완료", result_fail: "결과를 계산하지 못했습니다",
+    save_hint: "아래 [블록체인 저장] 버튼으로 결과를 저장할 수 있습니다.",
+    saved: "블록체인 저장 요청 완료 (트랜잭션 1개)",
+    no_camera: "이 브라우저에서는 카메라를 사용할 수 없습니다.",
+    no_torch: "이 브라우저에서는 플래시를 켤 수 없습니다. Android는 Chrome을 사용하세요.",
+    cam_denied: "카메라 권한을 허용해 주세요.",
+    bg_warn: "화면이 꺼지거나 다른 앱으로 전환되면 측정이 멈춥니다.",
+    collecting: "데이터 수집 중...", hr_now: "· 현재 약 {hr} bpm",
+    block_title: "블록 {i} / {n} · {label}",
+    guide_rest: "<b>휴식</b><br>화면 가운데 + 를 편안히 바라보세요.<br>손가락은 그대로 두고 움직이지 마세요.",
+    guide_1back: "<b>1-back</b><br>숫자가 <b>바로 앞 숫자와 같으면</b> [일치]를 누르세요.",
+    break_head: "잠시 쉬는 시간입니다. 손가락은 카메라 위에 그대로 두세요.", next_block: "다음 블록 안내",
+    sec_left: "{s}초 남음",
+    rate_title: "방금 <b>{label}</b> 블록에서 느낀<br><b>인지부하</b>는 어느 정도였나요?",
+    r_order: "진행 순서", r_load: "인지부하 (0-10)", r_beats: "검출된 IBI", r_hr: "평균 심박",
+    r_ibi: "평균 IBI", r_acc: "1-back 정확도", r_hitfa: "적중 / 오경보", r_rt: "평균 반응시간",
+    count: "{n}개", hitfa: "{h}/{n} · {fa}회",
+    res_label: "기록 구간 IBI — 파랑: 휴식, 주황: 1-back (회색 = 제외된 박동)",
+  },
+};
+let lang = "en";
+function t(key, vars) {
+  let s = (I18N[lang] && I18N[lang][key]) ?? I18N.en[key] ?? key;
+  for (const [k, v] of Object.entries(vars || {})) s = s.split(`{${k}}`).join(String(v));
+  return s;
+}
+function label(cond) { return t(cond === "rest" ? "rest" : "oneback"); }
+function wtext(w) { return w && typeof w === "object" ? (w[lang] || w.en || "") : (w || ""); }
+
 const COLOR = { rest: "#60a5fa", "1back": "#f59e0b" };
 
-const QMSG = {
-  warming:   ["#4b5563", "신호 확인 중... 검지 손가락을 카메라와 접촉을 유지해주세요"],
-  good:      ["#22c55e", "신호 좋음"],
-  fair:      ["#eab308", "신호 보통 — 손가락을 움직이지 마세요"],
-  poor:      ["#ef4444", "신호 약함 — 손가락을 가볍게 다시 올려 주세요"],
-  nofinger:  ["#6b7280", "손가락이 감지되지 않습니다 — 카메라와 플래시를 함께 덮어 주세요"],
-  dark:      ["#6b7280", "너무 어둡습니다 — 플래시가 켜졌는지 확인하세요"],
-  saturated: ["#ef4444", "너무 밝습니다 — 손가락으로 카메라를 완전히 덮어 주세요"],
-};
+const QCOLOR = { warming: "#4b5563", good: "#22c55e", fair: "#eab308", poor: "#ef4444",
+                 nofinger: "#6b7280", dark: "#6b7280", saturated: "#ef4444" };
+let curBlock = -1, rateCond = "", lastResult = null, resultFailText = "";
+function showQuality(q) {
+  const key = q in QCOLOR ? q : "warming";
+  $("qdot").style.background = QCOLOR[key]; $("qmsg").textContent = t("q_" + key);
+}
+function applyLang() {        // 정적 문구 + 지금 보이는 동적 문구를 현재 언어로 다시 그림
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-i18n]").forEach(el => { el.innerHTML = t(el.dataset.i18n); });
+  if (mode === "prep") { showQuality(args.quality); drawPreview(args.preview); }
+  if ((mode === "task" || mode === "rate") && curBlock >= 0)
+    $("blockTitle").textContent = t("block_title", { i: curBlock + 1, n: order.length, label: label(order[curBlock]) });
+  if (mode === "rate" && rateCond) $("rateTitle").innerHTML = t("rate_title", { label: label(rateCond) });
+  if (mode === "done") {
+    if (lastResult) renderResult(lastResult);
+    else if (resultFailText) $("doneTitle").textContent = t("result_fail");
+    else $("doneTitle").textContent = t("computing");
+    updateSaveHint();
+  }
+  setHeight();
+}
+function updateSaveHint() {
+  if (!lastResult) return;
+  $("saveHint").textContent = args.saved && args.saved.task_id === taskId ? t("saved") : t("save_hint");
+}
+
 
 function showView(v) {
   mode = v;
@@ -1111,19 +1275,17 @@ window.addEventListener("message", (ev) => {
   const d = ev.data;
   if (!d || d.type !== "streamlit:render") return;
   args = d.args || {};
+  if (args.lang && args.lang !== lang && I18N[args.lang]) { lang = args.lang; applyLang(); }
   if (args.run_id === runId && typeof args.ack === "number") queue = queue.filter(s => s[0] > args.ack);
   if (args.error && args.run_id === runId && mode !== "idle") { reset(); $("err").textContent = args.error; }
-  if (mode === "prep") {
-    const [c, m] = QMSG[args.quality] || QMSG.warming;
-    $("qdot").style.background = c; $("qmsg").textContent = m;
-    drawPreview(args.preview);
-  }
+  if (mode === "prep") { showQuality(args.quality); drawPreview(args.preview); }
   if (mode === "done" && args.result && args.result.task_id === taskId) {
-    if (!gotResult) { gotResult = true; renderResult(args.result); }
-    $("saveHint").textContent = args.saved && args.saved.task_id === taskId ? args.saved.text : "아래 [블록체인 저장] 버튼으로 결과를 저장할 수 있습니다.";
+    if (!gotResult) { gotResult = true; lastResult = args.result; renderResult(args.result); }
+    updateSaveHint();
   }
   if (mode === "done" && args.result_error && args.result_error.task_id === taskId) {
-    gotResult = true; $("doneTitle").textContent = "결과를 계산하지 못했습니다"; $("warn").textContent = args.result_error.text;
+    gotResult = true; resultFailText = args.result_error.text;
+    $("doneTitle").textContent = t("result_fail"); $("warn").textContent = resultFailText;
   }
   setHeight();
 });
@@ -1148,13 +1310,13 @@ function onVideoFrame(now, meta) {
   video.requestVideoFrameCallback(onVideoFrame);
 }
 async function startCamera() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("이 브라우저에서는 카메라를 사용할 수 없습니다.");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error(t("no_camera"));
   stream = await navigator.mediaDevices.getUserMedia({ audio: false,
     video: { facingMode: { ideal: "environment" }, width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 30, max: 30 } } });
   video.srcObject = stream; await video.play();
   track = stream.getVideoTracks()[0];
   try { await track.applyConstraints({ advanced: [{ torch: true }] }); $("torchNote").textContent = ""; }
-  catch (e) { $("torchNote").textContent = "이 브라우저에서는 플래시를 켤 수 없습니다. Android는 Chrome을 사용하세요."; }
+  catch (e) { $("torchNote").textContent = t("no_torch"); }
   sampling = true; lastMediaTime = -1;
   if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) video.requestVideoFrameCallback(onVideoFrame);
   else fallbackTimer = setInterval(() => sampleFrame(performance.now()), 33);
@@ -1193,7 +1355,7 @@ function fit(c) {
 function drawWave(c, wave) {
   const [g, w, h] = fit(c);
   g.fillStyle = "#6b7280"; g.font = "11px system-ui";
-  if (!wave || !wave.t.length) { g.fillText("데이터 수집 중...", 10, h / 2); return; }
+  if (!wave || !wave.t.length) { g.fillText(t("collecting"), 10, h / 2); return; }
   const X = t => w * (1 + t / 10), Y = y => h / 2 - y * h * 0.42;
   g.strokeStyle = "#60a5fa"; g.lineWidth = 2; g.beginPath();
   wave.t.forEach((t, i) => i ? g.lineTo(X(t), Y(wave.y[i])) : g.moveTo(X(t), Y(wave.y[i]))); g.stroke();
@@ -1219,7 +1381,7 @@ function drawIbi(c, series, xmin, xmax) {
 function drawPreview(p) {
   drawWave($("cWave"), p && p.wave);
   drawIbi($("cIbi"), p ? [{ t: p.ibi.t, ms: p.ibi.ms, valid: p.ibi.valid, color: "#22c55e" }] : [], -60, 0);
-  $("hrText").textContent = p && p.hr ? `· 현재 약 ${p.hr} bpm` : "";
+  $("hrText").textContent = p && p.hr ? t("hr_now", { hr: p.hr }) : "";
 }
 
 // ---- 1-back ----
@@ -1244,27 +1406,27 @@ function startSession() {
   const r = new Uint8Array(1); crypto.getRandomValues(r);
   order = (r[0] & 1) ? ["rest", "1back"] : ["1back", "rest"];      // 블록 순서 무작위
   taskId = randomId(); gotResult = false; taskPayload = null; blocksOut = []; cur = null;
+  lastResult = null; resultFailText = ""; curBlock = -1;
   showView("task");
   runBlock(0);
 }
 
 function runBlock(bi) {
   const cond = order[bi], total = nPre + nRec + nPost;
-  $("blockTitle").textContent = `블록 ${bi + 1} / ${order.length} · ${LABEL[cond]}`;
+  curBlock = bi;
+  $("blockTitle").textContent = t("block_title", { i: bi + 1, n: order.length, label: label(cond) });
   $("barFill").style.width = "0%";
   $("stim").textContent = ""; $("fix").classList.add("hidden"); $("progress").textContent = "";
   $("matchBtn").classList.toggle("hidden", cond !== "1back");
   $("matchBtn").disabled = true;
-  const guide = cond === "rest"
-    ? "<b>휴식</b><br>화면 가운데 + 를 편안히 바라보세요.<br>손가락은 그대로 두고 움직이지 마세요."
-    : "<b>1-back</b><br>숫자가 <b>바로 앞 숫자와 같으면</b> [일치]를 누르세요.";
+  const guideKey = cond === "rest" ? "guide_rest" : "guide_1back";
   const waiting = bi > 0;                               // 두 번째 블록 앞: 50초 대기
   let k = waiting ? gapS : breakS;
   const tickDown = () => {
     const head = waiting && k > breakS
-      ? `<span style="color:#8a96a3">잠시 쉬는 시간입니다. 손가락은 카메라 위에 그대로 두세요.</span><br><br>다음 블록 안내<br>`
+      ? `<span style="color:#8a96a3">${t("break_head")}</span><br><br>${t("next_block")}<br>`
       : "";
-    $("taskMsg").innerHTML = `${head}${guide}<br><span style="font-size:42px">${k}</span>`;
+    $("taskMsg").innerHTML = `${head}${t(guideKey)}<br><span style="font-size:42px">${k}</span>`;
     setHeight();
     if (k-- > 0) { later(tickDown, 1000); return; }
     $("taskMsg").textContent = ""; $("fix").classList.remove("hidden");
@@ -1290,7 +1452,7 @@ function showProgress(i, total) {
 function runRest(i, total, bi) {
   if (i >= total) return blockDone(bi);
   showProgress(i, total);
-  $("progress").textContent = `${Math.ceil((total - i) * trialMs / 1000)}초 남음`;
+  $("progress").textContent = t("sec_left", { s: Math.ceil((total - i) * trialMs / 1000) });
   later(() => runRest(i + 1, total, bi), t0 + (i + 1) * trialMs - performance.now());
 }
 
@@ -1325,8 +1487,8 @@ function blockDone(bi) {
 
 // ---- 인지부하 점수 (0~10). 슬라이더를 한 번은 움직여야 [확인] 가능 (기본값 5가 그대로 기록되는 것 방지) ----
 function askLoad(cond, done) {
-  rateDone = done; rateTouched = false;
-  $("rateTitle").innerHTML = `방금 <b>${LABEL[cond]}</b> 블록에서 느낀<br><b>인지부하</b>는 어느 정도였나요?`;
+  rateDone = done; rateTouched = false; rateCond = cond;
+  $("rateTitle").innerHTML = t("rate_title", { label: label(cond) });
   $("rateSlider").value = 5;
   $("rateValue").textContent = "–"; $("rateValue").classList.remove("set");
   $("rateBtn").disabled = true;
@@ -1349,7 +1511,7 @@ function finishSession() {
   timers.forEach(clearTimeout); timers = [];
   stopCamera();
   taskPayload = { task_id: taskId, trial_ms: trialMs, order: order.slice(), blocks: blocksOut };
-  $("doneTitle").textContent = "결과 계산 중..."; $("summary").replaceChildren();
+  $("doneTitle").textContent = t("computing"); $("summary").replaceChildren();
   $("warn").textContent = ""; $("saveHint").textContent = ""; $("resLabel").textContent = "";
   $("cRes").classList.add("hidden");
   showView("done");
@@ -1358,27 +1520,28 @@ function finishSession() {
 
 function fmt(v, unit) { return v == null ? "-" : `${v}${unit || ""}`; }
 function renderResult(r) {
-  $("doneTitle").textContent = "측정 완료";
+  $("doneTitle").textContent = t("done");
   const R = r.blocks.rest || {}, B = r.blocks["1back"] || {}, nb = B.nback || {};
   const table = document.createElement("table");
   const head = table.createTHead().insertRow();
-  for (const h of ["", "휴식", "1-back"]) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
+  for (const h of ["", label("rest"), label("1back")]) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
+  const cnt = v => v == null ? "-" : t("count", { n: v });
   const rows = [
-    ["진행 순서", r.order.map(c => LABEL[c]).join(" → "), ""],
-    ["인지부하 (0-10)", fmt(R.load), fmt(B.load)],
-    ["검출된 IBI", fmt(R.beats, "개"), fmt(B.beats, "개")],
-    ["평균 심박", fmt(R.hr_bpm, " bpm"), fmt(B.hr_bpm, " bpm")],
-    ["평균 IBI", fmt(R.mean_ibi_ms, " ms"), fmt(B.mean_ibi_ms, " ms")],
+    [t("r_order"), r.order.map(c => label(c)).join(" → "), ""],
+    [t("r_load"), fmt(R.load), fmt(B.load)],
+    [t("r_beats"), cnt(R.beats), cnt(B.beats)],
+    [t("r_hr"), fmt(R.hr_bpm, " bpm"), fmt(B.hr_bpm, " bpm")],
+    [t("r_ibi"), fmt(R.mean_ibi_ms, " ms"), fmt(B.mean_ibi_ms, " ms")],
     ["SDNN", fmt(R.sdnn_ms, " ms"), fmt(B.sdnn_ms, " ms")],
     ["RMSSD", fmt(R.rmssd_ms, " ms"), fmt(B.rmssd_ms, " ms")],
-    ["1-back 정확도", "", nb.accuracy == null ? "-" : `${Math.round(nb.accuracy * 100)}%`],
-    ["적중 / 오경보", "", nb.hit == null ? "-" : `${nb.hit}/${nb.hit + nb.miss} · ${nb.false_alarm}회`],
-    ["평균 반응시간", "", nb.mean_rt_hit_ms == null ? "-" : `${Math.round(nb.mean_rt_hit_ms)} ms`],
+    [t("r_acc"), "", nb.accuracy == null ? "-" : `${Math.round(nb.accuracy * 100)}%`],
+    [t("r_hitfa"), "", nb.hit == null ? "-" : t("hitfa", { h: nb.hit, n: nb.hit + nb.miss, fa: nb.false_alarm })],
+    [t("r_rt"), "", nb.mean_rt_hit_ms == null ? "-" : `${Math.round(nb.mean_rt_hit_ms)} ms`],
   ];
   const body = table.createTBody();
   for (const row of rows) {
     const tr = body.insertRow();
-    if (row[0] === "진행 순서") { tr.insertCell().textContent = row[0]; const td = tr.insertCell(); td.colSpan = 2; td.textContent = row[1]; continue; }
+    if (row[0] === t("r_order")) { tr.insertCell().textContent = row[0]; const td = tr.insertCell(); td.colSpan = 2; td.textContent = row[1]; continue; }
     row.forEach(v => { tr.insertCell().textContent = v; });
   }
   $("summary").replaceChildren(table);
@@ -1387,12 +1550,12 @@ function renderResult(r) {
     return { t: b.ibi_t_s, ms: b.ibi_ms, valid: b.valid, color: COLOR[c] };
   });
   if (series.some(s => s.t.length)) {
-    $("resLabel").textContent = "기록 구간 IBI — 파랑: 휴식, 주황: 1-back (회색 = 제외된 박동)";
+    $("resLabel").textContent = t("res_label");
     $("cRes").classList.remove("hidden");
     const dur = Math.max(R.rec_duration_s || 0, B.rec_duration_s || 0) || 25;
     drawIbi($("cRes"), series, 0, dur);
   }
-  $("warn").textContent = r.order.map(c => r.blocks[c].warning ? `${LABEL[c]}: ${r.blocks[c].warning}` : "").filter(Boolean).join(" ");
+  $("warn").textContent = r.order.map(c => wtext(r.blocks[c].warning) ? `${label(c)}: ${wtext(r.blocks[c].warning)}` : "").filter(Boolean).join(" ");
   setHeight();
 }
 
@@ -1412,7 +1575,7 @@ $("prepBtn").addEventListener("click", async () => {
     sendTimer = setInterval(push, 1000);
   } catch (e) {
     reset();
-    $("err").textContent = e && e.name === "NotAllowedError" ? "카메라 권한을 허용해 주세요." : (e.message || String(e));
+    $("err").textContent = e && e.name === "NotAllowedError" ? t("cam_denied") : (e.message || String(e));
   } finally { $("prepBtn").disabled = false; }
 });
 $("startBtn").addEventListener("click", startSession);
@@ -1420,9 +1583,10 @@ $("cancelBtn").addEventListener("click", () => { setValue({ run_id: runId, seq: 
 $("againBtn").addEventListener("click", reset);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible" && (mode === "prep" || mode === "task"))
-    $("err").textContent = "화면이 꺼지거나 다른 앱으로 전환되면 측정이 멈춥니다.";
+    $("err").textContent = t("bg_warn");
 });
 window.addEventListener("resize", () => { if (mode === "prep") drawPreview(args.preview); });
+applyLang();
 post("streamlit:componentReady", { apiVersion: 1 });
 setHeight();
 </script></body></html>
@@ -1484,68 +1648,80 @@ def _load_chain(version: str, nonce: int):
 
 
 def chain_page():
-    st.markdown(f"### {CHAIN_ICON} {CHAIN_NAME}")
-    st.caption(f"컨트랙트 `{CONTRACT_ADDR}` · 노드 `{NODE_URL}`")
-    if st.button("🔄 새로 불러오기"):
+    st.markdown(f"### {CHAIN_ICON} {chain_name()}")
+    st.caption(tr(f"Contract `{CONTRACT_ADDR}` · Node `{NODE_URL}`", f"컨트랙트 `{CONTRACT_ADDR}` · 노드 `{NODE_URL}`"))
+    if st.button(tr("🔄 Reload", "🔄 새로 불러오기")):
         st.session_state['chain_nonce'] = st.session_state.get('chain_nonce', 0) + 1
     try:
-        with st.spinner("블록체인에서 기록을 불러오는 중..."):
+        with st.spinner(tr("Loading records from the blockchain...", "블록체인에서 기록을 불러오는 중...")):
             parsed = _load_chain(CODE_VERSION, st.session_state.get('chain_nonce', 0))
     except NodeError as exc:
-        st.error(str(exc))
+        st.error(err_text(exc))
         return
     import pandas as pd
     raw, blocks, beats = parsed['raw'], parsed['blocks'], parsed['beats']
     m = st.columns(2)
-    m[0].metric("PPG 측정", len({(b['measurement_id'], b['participant_id']) for b in blocks}))
-    m[1].metric("참가자", len({b['participant_id'] for b in blocks}))
+    m[0].metric(tr("PPG measurements", "PPG 측정"), len({(b['measurement_id'], b['participant_id']) for b in blocks}))
+    m[1].metric(tr("Participants", "참가자"), len({b['participant_id'] for b in blocks}))
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
     try:
         xlsx = excel_bytes(parsed)
     except ImportError:
         xlsx = None
     if xlsx is not None:
-        st.download_button("📥 엑셀로 내려받기 (.xlsx)", xlsx, f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
+        st.download_button(tr("📥 Download Excel (.xlsx)", "📥 엑셀로 내려받기 (.xlsx)"), xlsx,
+                           f"blockchain_{CONTRACT_ADDR[:8]}_{stamp}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
-        st.caption("엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문). 시각은 한국 시간(KST).")
+        st.caption(tr("Sheets: PPG summary (per block) · PPG IBI (per beat, decompressed) · All records (every raw "
+                      "record in the contract). Times are Korea Standard Time (KST).",
+                      "엑셀 시트: PPG 요약(블록별) · PPG IBI(박동별, 압축 해제) · 전체 기록(컨트랙트의 모든 원문). "
+                      "시각은 한국 시간(KST)."))
     else:
         # openpyxl이 없으면(requirements.txt 누락) 같은 내용을 CSV 3개로 제공
-        st.warning("서버에 openpyxl이 설치되지 않아 엑셀 파일을 만들 수 없습니다. "
-                   "requirements.txt에 openpyxl을 추가하세요. 우선 같은 내용을 CSV로 내려받을 수 있습니다.")
+        st.warning(tr("openpyxl is not installed on the server, so the Excel file cannot be created. Add openpyxl "
+                      "to requirements.txt. Meanwhile you can download the same data as CSV.",
+                      "서버에 openpyxl이 설치되지 않아 엑셀 파일을 만들 수 없습니다. requirements.txt에 openpyxl을 "
+                      "추가하세요. 우선 같은 내용을 CSV로 내려받을 수 있습니다."))
         c1, c2, c3 = st.columns(3)
-        for col, (label, rows, name) in zip((c1, c2, c3), (("PPG 요약 CSV", blocks, 'ppg_summary'),
-                                                          ("PPG IBI CSV", beats, 'ppg_ibi'),
-                                                          ("전체 기록 CSV", raw, 'all_records'))):
+        for col, (label, rows, name) in zip((c1, c2, c3), (
+                (tr("PPG summary CSV", "PPG 요약 CSV"), blocks, 'ppg_summary'),
+                ("PPG IBI CSV", beats, 'ppg_ibi'),
+                (tr("All records CSV", "전체 기록 CSV"), raw, 'all_records'))):
             col.download_button(label, rows_csv(rows), f"blockchain_{name}_{stamp}.csv", "text/csv")
 
-    st.subheader("PPG 측정 (블록별)")
+    st.subheader(tr("PPG measurements (per block)", "PPG 측정 (블록별)"))
     if blocks:
         df = pd.DataFrame(blocks)
         pids = sorted(df['participant_id'].unique())
-        chosen = st.multiselect("참가자 필터", pids)
+        chosen = st.multiselect(tr("Filter participants", "참가자 필터"), pids)
         if chosen:
             df = df[df['participant_id'].isin(chosen)]
-        df['condition'] = df['condition'].map(COND_LABEL).fillna(df['condition'])
+        df['condition'] = df['condition'].map(COND_LABELS[lang()]).fillna(df['condition'])
         view = df[['participant_id', 'measurement_id', 'condition', 'order', 'rec_start_kst', 'cognitive_load',
                    'hr_bpm', 'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms', 'beats_valid', 'beats_excluded', 'nback_hit',
                    'nback_miss', 'nback_false_alarm', 'nback_mean_rt_ms', 'block_time_kst', 'schema']]
         view = view.assign(cognitive_load=view['cognitive_load'].astype('Int64'))   # 이전 기록은 빈칸, 나머지는 정수
-        st.dataframe(view.rename(columns={'rec_start_kst': '기록 시작 (KST)', 'block_time_kst': '블록 시각 (KST)',
-                                          'cognitive_load': '인지부하'}), hide_index=True)
+        st.dataframe(view.rename(columns={
+            'rec_start_kst': tr('Recording start (KST)', '기록 시작 (KST)'),
+            'block_time_kst': tr('Block time (KST)', '블록 시각 (KST)'),
+            'cognitive_load': tr('Cognitive load', '인지부하')}), hide_index=True)
     else:
-        st.caption("PPG 기록이 없습니다.")
+        st.caption(tr("No PPG records.", "PPG 기록이 없습니다."))
 
 
 def phone_page():
-    st.markdown(f"### {MEASURE_ICON} {MEASURE_NAME}")
-    pid_raw = st.text_input("참가자 코드", placeholder="P01", max_chars=4)
+    st.markdown(f"### {MEASURE_ICON} {measure_name()}")
+    # 언어를 바꿔도 입력값과 진행 중인 측정이 유지되도록 위젯 라벨은 언어와 무관하게 고정하고, 보이는 라벨은 따로 표시
+    st.markdown(f"**{tr('Participant code', '참가자 코드')}**")
+    pid_raw = st.text_input("participant_code", placeholder="P01", max_chars=4, key='pid',
+                            label_visibility="collapsed")
     if not pid_raw:
-        st.caption("실험자가 알려준 참가자 코드를 입력하세요.")
+        st.caption(tr("Enter the participant code given by the experimenter.", "실험자가 알려준 참가자 코드를 입력하세요."))
         return
     try:
         pid = validate_pid(pid_raw)
     except ValueError as exc:
-        st.error(str(exc))
+        st.error(err_text(exc))
         return
     phone_panel(pid, DEFAULT_TRIAL_MS)
 
@@ -1557,6 +1733,7 @@ def phone_panel(pid: str, trial_ms: int):
     state = st.session_state.setdefault(f'phone_{pid}', {})
     component = ppg_component()
     value = component(
+        lang=lang(),
         run_id=state.get('run_id', ''), ack=state.get('ack', 0.0), quality=state.get('quality', 'warming'),
         error=state.get('error', ''), preview=state.get('preview'), result=state.get('result_public'),
         result_error=state.get('result_error'), saved=state.get('saved'),
@@ -1570,7 +1747,7 @@ def phone_panel(pid: str, trial_ms: int):
             out = store.ingest(pid, value)
             state.update(ack=out['ack'], quality=out['quality'], error='')
         except IngestError as exc:
-            state['error'] = str(exc)
+            state['error'] = err_text(exc)
         mode = value.get('mode')
         state['preview'] = make_preview(store.live(pid, 60_000)) if mode == 'prep' and not state['error'] else None
         task = value.get('task')
@@ -1585,7 +1762,7 @@ def phone_panel(pid: str, trial_ms: int):
                     if result is not None:
                         state['result_public'] = public_result(result)
                 except ValueError as exc:
-                    state['result_error'] = {'task_id': tid, 'text': str(exc)}
+                    state['result_error'] = {'task_id': tid, 'text': err_text(exc)}
 
     # ---- 결과 아래: 블록체인 저장 ----
     pub = state.get('result_public')
@@ -1597,27 +1774,33 @@ def phone_panel(pid: str, trial_ms: int):
     st.divider()
     size = record_size(result)
     if result['tx_id']:
-        st.success("블록체인 저장 요청 완료 (트랜잭션 1개)")
+        st.success(tr("Saved to the blockchain (1 transaction)", "블록체인 저장 요청 완료 (트랜잭션 1개)"))
         st.code(result['tx_id'], language=None)
-        st.caption(f"상단의 [{CHAIN_NAME}]에서 기록을 확인할 수 있습니다. 블록이 만들어진 뒤에 나타납니다.")
+        st.caption(tr(f"You can check the record in [{chain_name()}] at the top once the block is created.",
+                      f"상단의 [{chain_name()}]에서 기록을 확인할 수 있습니다. 블록이 만들어진 뒤에 나타납니다."))
     elif all(b['hr_bpm'] is None for b in result['blocks'].values()):
-        st.warning("IBI 결과가 없어 저장할 수 없습니다. 다시 측정하세요.")
+        st.warning(tr("No IBI results, so this cannot be saved. Please measure again.",
+                      "IBI 결과가 없어 저장할 수 없습니다. 다시 측정하세요."))
     elif size > MAX_TX_DATA_BYTES:
-        st.error(f"기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘어 트랜잭션 하나에 담을 수 없습니다. "
-                 "다시 측정하세요.")
+        st.error(tr(f"The record ({size} bytes) exceeds the node limit of {MAX_TX_DATA_BYTES} bytes and does not fit "
+                    "in one transaction. Please measure again.",
+                    f"기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘어 트랜잭션 하나에 담을 수 "
+                    "없습니다. 다시 측정하세요."))
     else:
         n_ibi = sum(len(b['ibi_ms']) for b in result['blocks'].values())
-        st.caption(f"휴식·1-back IBI {n_ibi}개 + 1-back 결과를 트랜잭션 1개로 기록합니다 "
-                   f"({size} / {MAX_TX_DATA_BYTES}바이트). 공개 블록체인 기록은 삭제할 수 없습니다.")
-        if st.button("🔗 블록체인 저장", type="primary", key=f"save_{result['task_id']}"):
+        st.caption(tr(f"Saves {n_ibi} rest/1-back IBIs, the 1-back results, and the cognitive load ratings in one "
+                      f"transaction ({size} / {MAX_TX_DATA_BYTES} bytes). Public blockchain records cannot be deleted.",
+                      f"휴식·1-back IBI {n_ibi}개 + 1-back 결과 + 인지부하 점수를 트랜잭션 1개로 기록합니다 "
+                      f"({size} / {MAX_TX_DATA_BYTES}바이트). 공개 블록체인 기록은 삭제할 수 없습니다."))
+        if st.button(tr("🔗 Save to blockchain", "🔗 블록체인 저장"), type="primary", key=f"save_{result['task_id']}"):
             try:
-                with st.spinner("서명 및 전송 중..."):
+                with st.spinner(tr("Signing and sending...", "서명 및 전송 중...")):
                     save_to_blockchain(store, result)
-                state['saved'] = {'task_id': result['task_id'], 'text': '블록체인 저장 요청 완료 (트랜잭션 1개)'}
+                state['saved'] = {'task_id': result['task_id'], 'saved': True}
                 st.rerun(scope="fragment")
             except NodeError as exc:
-                st.error(f"저장 실패: {exc}")
-    with st.expander("이 측정 데이터 내려받기"):
+                st.error(tr("Save failed: ", "저장 실패: ") + err_text(exc))
+    with st.expander(tr("Download this measurement", "이 측정 데이터 내려받기")):
         c1, c2 = st.columns(2)
         c1.download_button("IBI CSV", csv_ibi([result]), f"{pid}_{result['task_id'][:8]}_ibi.csv", "text/csv",
                            key=f"dl_ibi_{result['task_id']}")
@@ -1630,57 +1813,61 @@ def experimenter_login() -> bool:
         return True
     password = config('MONITOR_PASSWORD')
     if not password:
-        st.error("secrets 또는 환경변수에 MONITOR_PASSWORD를 설정하세요.")
+        st.error(tr("Set MONITOR_PASSWORD in secrets or environment variables.",
+                    "secrets 또는 환경변수에 MONITOR_PASSWORD를 설정하세요."))
         return False
-    entered = st.text_input("실험자 비밀번호", type="password")
+    entered = st.text_input(tr("Experimenter password", "실험자 비밀번호"), type="password")
     if entered:
         if secrets.compare_digest(entered, password):
             st.session_state['experimenter'] = True
             st.rerun()
         else:
             time.sleep(1)
-            st.error("비밀번호가 틀렸습니다.")
+            st.error(tr("Wrong password.", "비밀번호가 틀렸습니다."))
     return False
 
 
 def monitor_page():
-    st.title("📈 PPG 실험자 모니터")
+    st.title(tr("📈 PPG Experimenter Monitor", "📈 PPG 실험자 모니터"))
     if not experimenter_login():
         return
     store = get_store()
     sessions = store.session_list()
     top = st.columns([3, 1])
-    if top[1].button("🔄 새로고침"):
+    if top[1].button(tr("🔄 Refresh", "🔄 새로고침")):
         st.rerun()
     if sessions:
-        labels = {s['pid']: f"{s['pid']} {'● 연결됨' if s['connected'] else '○ 끊김'}" for s in sessions}
-        pid = top[0].selectbox("참가자", list(labels), format_func=labels.get)
+        on, off = tr('● connected', '● 연결됨'), tr('○ disconnected', '○ 끊김')
+        labels = {s['pid']: f"{s['pid']} {on if s['connected'] else off}" for s in sessions}
+        pid = top[0].selectbox(tr("Participant", "참가자"), list(labels), format_func=labels.get)
         live_panel(pid)
     else:
-        top[0].info("아직 측정 중인 폰이 없습니다.")
+        top[0].info(tr("No phone is measuring yet.", "아직 측정 중인 폰이 없습니다."))
 
-    st.subheader("완료된 측정")
+    st.subheader(tr("Completed measurements", "완료된 측정"))
     results = store.all_results()
     if not results:
-        st.caption("완료된 측정이 없습니다.")
+        st.caption(tr("No completed measurements.", "완료된 측정이 없습니다."))
         return
     import pandas as pd
-    rows = [{'참가자': r['participant_id'], '측정': r['task_id'][:8], '조건': COND_LABEL[b['condition']],
-             '순서': b['order'], '기록 시작(KST)': to_kst(b['rec_start_utc'])[11:19], '부하': b['load'],
-             'HR': b['hr_bpm'],
-             'IBI': b['mean_ibi_ms'], 'SDNN': b['sdnn_ms'], 'RMSSD': b['rmssd_ms'], '박동': b['beats'],
-             '커버리지': b['coverage'],
-             '1-back 정확도': b['nback']['accuracy'] if 'nback' in b else None,
+    rows = [{tr('Participant', '참가자'): r['participant_id'], tr('Measurement', '측정'): r['task_id'][:8],
+             tr('Condition', '조건'): cond_label(b['condition']), tr('Order', '순서'): b['order'],
+             tr('Start (KST)', '기록 시작(KST)'): to_kst(b['rec_start_utc'])[11:19], tr('Load', '부하'): b['load'],
+             'HR': b['hr_bpm'], 'IBI': b['mean_ibi_ms'], 'SDNN': b['sdnn_ms'], 'RMSSD': b['rmssd_ms'],
+             tr('Beats', '박동'): b['beats'], tr('Coverage', '커버리지'): b['coverage'],
+             tr('1-back accuracy', '1-back 정확도'): b['nback']['accuracy'] if 'nback' in b else None,
              "d'": b['nback']['d_prime'] if 'nback' in b else None,
              'RT': b['nback']['mean_rt_hit_ms'] if 'nback' in b else None,
-             '저장 tx': r['tx_id'][:12], '경고': b['warning']} for r, b in _blocks(results)]
+             tr('Saved tx', '저장 tx'): r['tx_id'][:12], tr('Warning', '경고'): bi_text(b['warning'])}
+            for r, b in _blocks(results)]
     st.dataframe(pd.DataFrame(rows), hide_index=True)
     c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("블록 요약 CSV", csv_summary(results), "ppg_rest_1back_summary.csv", "text/csv")
+    c1.download_button(tr("Block summary CSV", "블록 요약 CSV"), csv_summary(results), "ppg_rest_1back_summary.csv", "text/csv")
     c2.download_button("IBI CSV", csv_ibi(results), "ppg_rest_1back_ibi.csv", "text/csv")
     c3.download_button("1-back CSV", csv_trials(results), "ppg_rest_1back_trials.csv", "text/csv")
     if sessions:
-        c4.download_button("선택 참가자 원시 신호", store.csv_raw(pid), f"{pid}_raw.csv", "text/csv")
+        c4.download_button(tr("Raw signal (selected)", "선택 참가자 원시 신호"), store.csv_raw(pid),
+                           f"{pid}_raw.csv", "text/csv")
 
 
 @st.fragment(run_every=1.0)
@@ -1689,40 +1876,57 @@ def live_panel(pid: str):
     import pandas as pd
     live = get_store().live(pid)
     if live is None:
-        st.info("데이터가 없습니다.")
+        st.info(tr("No data.", "데이터가 없습니다."))
         return
     res = live['res']
     m = st.columns(4)
-    m[0].metric("폰 연결", "연결됨" if live['connected'] else
-                ("데이터 없음" if live['last_seen_s'] is None else f"끊김 ({live['last_seen_s']}s)"))
-    m[1].metric("심박 (15초)", f"{live['hr15']['hr_bpm']} bpm" if res and live['hr15']['hr_bpm'] else "-")
-    m[2].metric("신호 품질", f"{res['quality']:.2f} ({quality_label(res['quality'])})" if res else "-")
-    m[3].metric("카메라 FPS", live['fps'] or "-")
+    if live['connected']:
+        conn = tr("Connected", "연결됨")
+    elif live['last_seen_s'] is None:
+        conn = tr("No data", "데이터 없음")
+    else:
+        conn = tr(f"Lost ({live['last_seen_s']}s)", f"끊김 ({live['last_seen_s']}s)")
+    m[0].metric(tr("Phone", "폰 연결"), conn)
+    m[1].metric(tr("Heart rate (15 s)", "심박 (15초)"), f"{live['hr15']['hr_bpm']} bpm" if res and live['hr15']['hr_bpm'] else "-")
+    m[2].metric(tr("Signal quality", "신호 품질"), f"{res['quality']:.2f} ({quality_label(res['quality'])})" if res else "-")
+    m[3].metric(tr("Camera FPS", "카메라 FPS"), live['fps'] or "-")
     if not res:
         return
     p = make_preview(live)
     wave = pd.DataFrame({'t': p['wave']['t'], 'y': p['wave']['y']})
     peaks = pd.DataFrame({'t': p['wave']['pt'], 'y': p['wave']['py']})
-    x = alt.X('t:Q', title='초 (현재 = 0)', scale=alt.Scale(domain=[-10, 0]))
+    x = alt.X('t:Q', title=tr('seconds (now = 0)', '초 (현재 = 0)'), scale=alt.Scale(domain=[-10, 0]))
     chart = (alt.Chart(wave).mark_line(color='#3b82f6').encode(x=x, y=alt.Y('y:Q', title=None, axis=None))
              + alt.Chart(peaks).mark_circle(color='#ef4444', size=60).encode(x=x, y='y:Q')).properties(height=180)
     st.altair_chart(chart)
 
 
+def language_picker():
+    """화면 위 언어 선택. 기본 영어, 주소에 ?lang=ko 가 있으면 처음에 한국어."""
+    if 'lang' not in st.session_state:
+        q = st.query_params.get('lang')
+        st.session_state['lang'] = q if q in LANGS else DEFAULT_LANG
+    st.radio("Language / 언어", list(LANGS), format_func=LANGS.get, key='lang', horizontal=True,
+             label_visibility="collapsed")
+
+
 def main():
     is_monitor = st.query_params.get('page') == 'monitor'
-    st.set_page_config(page_title="PPG 모니터" if is_monitor else "PPG 측정",
+    st.set_page_config(page_title="PPG Monitor" if is_monitor else "PPG",
                        layout="wide" if is_monitor else "centered")
+    language_picker()
     if is_monitor:
         monitor_page()
         return
-    views = [f"{MEASURE_ICON} {MEASURE_NAME}", f"{CHAIN_ICON} {CHAIN_NAME}"]
-    view = st.radio("화면", views, horizontal=True, label_visibility="collapsed",
-                    help=f"측정 중에 [{CHAIN_NAME}]로 바꾸면 진행 중인 측정이 중단됩니다.")
-    if view == views[1]:
+    views = [f"{MEASURE_ICON} {measure_name()}", f"{CHAIN_ICON} {chain_name()}"]
+    view_i = st.radio("screen", [0, 1], format_func=lambda i: views[i], horizontal=True,
+                      label_visibility="collapsed", key='view')
+    if view_i == 1:
         chain_page()
-    else:
-        phone_page()
+        return
+    st.caption(tr(f"Switching to [{chain_name()}] during a measurement stops it.",
+                  f"측정 중에 [{chain_name()}]로 바꾸면 진행 중인 측정이 중단됩니다."))
+    phone_page()
 
 
 if __name__ == '__main__':
