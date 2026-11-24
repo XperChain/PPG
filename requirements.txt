@@ -6,4 +6,4 @@ matplotlib
 requests
 cryptography
 python-dotenv
-
+openpyxl
