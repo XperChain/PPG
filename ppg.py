@@ -1,4 +1,4 @@
-"""PPG + 시각 1-back 측정 Streamlit 앱 (한 화면에서 준비 → 측정 → 결과 → 블록체인 저장).
+"""PPG + 휴식/1-back 측정 Streamlit 앱 (한 화면에서 준비 → 측정 → 결과 → 블록체인 저장).
 
     streamlit run ppg_realtime.py
 
@@ -7,19 +7,22 @@
 
 흐름 (폰 한 화면)
   1) [측정 준비]  카메라+플래시 ON → PPG 파형과 검출된 박동, IBI 그래프를 1초마다 갱신해 신호 확인
-  2) [측정 시작]  시각 1-back (숫자 20개)
-                  숫자 1~5   : 적응 구간 (기록 안 함)
-                  숫자 6~15  : IBI 기록 구간
-                  숫자 16~20 : 마무리 구간 (기록 안 함)
-                  → 기록 구간의 IBI와 1-back 결과를 계산해 화면에 표시
-  3) [블록체인 저장]  IBI 데이터 + 1-back 결과를 XperChain LogBook에 기록
-                  (노드의 526바이트 제한 때문에 IBI가 많으면 여러 트랜잭션으로 나눠 저장)
+  2) [측정 시작]  휴식 블록과 1-back 블록을 무작위 순서로 진행 (휴식→1-back 또는 1-back→휴식)
+                  두 블록 모두 숫자 20칸 길이이며 같은 구간에서 IBI를 기록:
+                    1~5칸   적응 구간 (기록 안 함)
+                    6~15칸  IBI 기록 구간
+                    16~20칸 마무리 구간 (기록 안 함)
+                  휴식 블록: 화면의 + 를 바라보며 가만히 있기 (응답 없음)
+                  1-back 블록: 숫자가 바로 앞 숫자와 같으면 [일치]
+                  블록 사이에 안내 + 5초 카운트다운
+  3) [블록체인 저장]  두 블록의 IBI 데이터 + 1-back 결과를 XperChain LogBook에 기록
+                  (노드의 526바이트 제한 때문에 블록마다 필요하면 여러 트랜잭션으로 나눠 저장)
 
-블록체인 기록 형식 (schema = ppg_1back_v1, 키를 짧게 써서 용량 절약)
-  mid  측정 ID            pid  참가자 코드       p/n  조각 번호/전체 조각 수
-  t    기록 시작 시각(UTC) hr/sdnn/rmssd  기록 구간 요약 (첫 조각에만)
-  nb   1-back [적중, 놓침, 오경보, 정기각, 적중 평균 RT(ms), 숫자 간격(ms)]  (첫 조각에만)
-  b0   기록 시작부터 첫 박동까지(ms)  (첫 조각에만)
+블록체인 기록 형식 (schema = ppg_rest_1back_v1, 키를 짧게 써서 용량 절약)
+  mid  측정 ID       pid  참가자 코드      c  블록 조건 (rest | 1back)     o  진행 순서 (1 | 2)
+  p/n  블록 안 조각 번호/조각 수
+  t    기록 구간 시작 시각(UTC)   hr/sdnn/rmssd  기록 구간 요약   b0  기록 시작~첫 박동(ms)  (블록 첫 조각에만)
+  nb   1-back [적중, 놓침, 오경보, 정기각, 적중 평균 RT(ms), 숫자 간격(ms)]   (1back 블록 첫 조각에만)
   ibi  IBI(ms) 목록. 음수는 이상치로 제외된 박동 (예: -1520)
 
 설정 (.streamlit/secrets.toml 또는 환경변수)
@@ -75,15 +78,18 @@ def config(name: str, default: str = '') -> str:
 
 CONTRACT_ADDR = config('XPER_CONTRACT_ADDRESS', 'Ced62f5ada9c3bb783ce71a05db811a937d9a8f19')
 NODE_URL = config('XPER_NODE_URL', 'http://ai-labs.duckdns.org:5000').rstrip('/')
-SCHEMA = 'ppg_1back_v1'
-TITLE = 'PPG 1-back'
+SCHEMA = 'ppg_rest_1back_v1'
+TITLE = 'PPG Rest/1-back'
+CONDITIONS = ('rest', '1back')
+COND_LABEL = {'rest': '휴식', '1back': '1-back'}
 MAX_TX_DATA_BYTES = 526
 
-# 1-back 구성 (숫자 개수)
+# 블록 구성 (숫자 칸 수, 휴식 블록도 같은 길이)
 N_PRE, N_REC, N_POST = 5, 10, 5
 N_TOTAL = N_PRE + N_REC + N_POST
 STIM_MS = 500                      # 숫자 제시 시간
-DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (기록 구간 = 10 × 2.5초 = 25초)
+DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (블록당 기록 구간 = 10 × 2.5초 = 25초)
+BREAK_S = 5                        # 블록 시작 전 안내 + 카운트다운
 
 FS = 30.0
 GAP_MS = 400.0
@@ -394,9 +400,9 @@ class Store:
                        all=hrv_stats(res['ibi_ms'], res['valid']))
         return out
 
-    # ---- 1-back 측정 결과 ----
+    # ---- 휴식 / 1-back 측정 결과 ----
     def compute_result(self, pid: str, run_id: str, task: dict, waited_s: float) -> dict | None:
-        """기록 구간(폰 시계)의 IBI + 1-back 성적. 데이터가 아직 다 안 왔으면 None."""
+        """두 블록 각각의 기록 구간(폰 시계) IBI + 1-back 성적. 데이터가 아직 다 안 왔으면 None."""
         task_id = task.get('task_id')
         if not isinstance(task_id, str) or not RUN_ID_RE.fullmatch(task_id):
             raise ValueError('측정 ID 오류')
@@ -404,79 +410,110 @@ class Store:
         if not _num(trial_ms) or not 1000 <= trial_ms <= 6000:
             raise ValueError('숫자 간격 값 오류')
         trial_ms = int(trial_ms)
-        times = [task.get(k) for k in ('task_start_tp', 'rec_start_tp', 'rec_end_tp', 'task_end_tp')]
-        if not all(_num(v) for v in times):
-            raise ValueError('과제 시각 값 오류')
-        t_start, rec_start, rec_end, t_end = map(float, times)
-        expected = (N_PRE * trial_ms, N_REC * trial_ms, N_POST * trial_ms)
-        actual = (rec_start - t_start, rec_end - rec_start, t_end - rec_end)
-        if any(abs(a - e) > 5 for a, e in zip(actual, expected)):
-            raise ValueError('과제 구간 시각이 설정과 맞지 않습니다.')
-        raw_trials = task.get('trials')
-        if not isinstance(raw_trials, list) or len(raw_trials) != N_TOTAL:
-            raise ValueError('1-back 시행 데이터 오류')
-        trials = []
-        for t in raw_trials:
-            if not isinstance(t, dict) or str(t.get('s', '')) not in '123456789' or len(str(t.get('s', ''))) != 1:
-                raise ValueError('1-back 자극 값 오류')
-            responded = t.get('r') is True
-            rt = t.get('rt')
-            rt = round(float(rt), 1) if responded and _num(rt) and 0 <= rt <= 6000 else None
-            trials.append({'s': str(t['s']), 'r': responded, 'rt': rt})
+        order = task.get('order')
+        if not isinstance(order, list) or sorted(order) != sorted(CONDITIONS):
+            raise ValueError('블록 순서 값 오류')
+        raw_blocks = task.get('blocks')
+        if not isinstance(raw_blocks, list) or len(raw_blocks) != len(order):
+            raise ValueError('블록 데이터 오류')
+
+        blocks, prev_end = [], -math.inf
+        for i, (cond, b) in enumerate(zip(order, raw_blocks)):
+            if not isinstance(b, dict) or b.get('cond') != cond:
+                raise ValueError('블록 순서가 맞지 않습니다.')
+            times = [b.get(k) for k in ('start_tp', 'rec_start_tp', 'rec_end_tp', 'end_tp')]
+            if not all(_num(v) for v in times):
+                raise ValueError('블록 시각 값 오류')
+            start, rec_start, rec_end, end = map(float, times)
+            expected = (N_PRE * trial_ms, N_REC * trial_ms, N_POST * trial_ms)
+            actual = (rec_start - start, rec_end - rec_start, end - rec_end)
+            if any(abs(a - e) > 5 for a, e in zip(actual, expected)) or start < prev_end:
+                raise ValueError('블록 구간 시각이 설정과 맞지 않습니다.')
+            prev_end = end
+            trials = None
+            if cond == '1back':
+                raw_trials = b.get('trials')
+                if not isinstance(raw_trials, list) or len(raw_trials) != N_TOTAL:
+                    raise ValueError('1-back 시행 데이터 오류')
+                trials = []
+                for t in raw_trials:
+                    sv = str(t.get('s', '')) if isinstance(t, dict) else ''
+                    if len(sv) != 1 or sv not in '123456789':
+                        raise ValueError('1-back 자극 값 오류')
+                    responded = t.get('r') is True
+                    rt = t.get('rt')
+                    rt = round(float(rt), 1) if responded and _num(rt) and 0 <= rt <= 6000 else None
+                    trials.append({'s': sv, 'r': responded, 'rt': rt})
+            blocks.append({'cond': cond, 'order': i + 1, 'start': start, 'rec_start': rec_start,
+                           'rec_end': rec_end, 'end': end, 'trials': trials})
 
         with self.lock:
             sess = self.sessions.get(pid)
             if sess is None or sess.run_id != run_id:
                 raise ValueError('측정 세션이 바뀌었습니다. 다시 측정하세요.')
-            if any(r.get('task_id') == task_id for r in sess.results):
-                return next(r for r in sess.results if r.get('task_id') == task_id)
+            done = next((r for r in sess.results if r.get('task_id') == task_id), None)
+            if done:
+                return done
             i0 = sess.run_start_idx
             tp = np.asarray(sess.tp[i0:]); r = np.asarray(sess.r[i0:]); g = np.asarray(sess.g[i0:])
-        if (len(tp) == 0 or tp[-1] < rec_end + 2000) and waited_s < 20:
-            return None                                  # 기록 구간 끝 이후 2초까지 도착을 기다림
-        mask = (tp >= rec_start - 20_000) & (tp <= t_end + 2000)   # 필터 안정화를 위해 앞부분 포함
-        res = analyze(tp[mask], r[mask], g[mask]) if mask.sum() > 1 else None
+            offset = sess.offset_ms
+        last_rec_end = max(b['rec_end'] for b in blocks)
+        if (len(tp) == 0 or tp[-1] < last_rec_end + 2000) and waited_s < 20:
+            return None                                  # 마지막 기록 구간 이후 2초까지 도착을 기다림
 
-        result = {
-            'task_id': task_id, 'participant_id': pid, 'trial_ms': trial_ms,
-            'rec_start_utc': utc_iso(rec_start + sess.offset_ms), 'rec_duration_s': round((rec_end - rec_start) / 1000, 1),
-            'nback': score_nback(trials, 1), 'trials': trials,
-            'ibi_ms': [], 'valid': [], 'ibi_t_s': [], 'first_beat_ms': None,
-            'hr_bpm': None, 'mean_ibi_ms': None, 'sdnn_ms': None, 'rmssd_ms': None,
-            'beats': 0, 'excluded': 0, 'coverage': 0.0, 'quality': None, 'warning': '', 'tx_ids': [],
-        }
-        if res is None:
-            result['warning'] = '신호가 부족해 IBI를 계산하지 못했습니다. 손가락 위치를 확인하고 다시 측정하세요.'
-        else:
-            pk = res['peak_ms']
-            sel = (pk[:-1] >= rec_start) & (pk[1:] <= rec_end)
-            ibi, valid = res['ibi_ms'][sel], res['valid'][sel]
-            stats = hrv_stats(ibi, valid)
-            coverage = float(ibi[valid].sum() / (rec_end - rec_start)) if len(ibi) else 0.0
-            result.update({
-                'ibi_ms': [round(float(v), 1) for v in ibi], 'valid': [bool(v) for v in valid],
-                'ibi_t_s': [round(float((e - rec_start) / 1000), 2) for e in pk[1:][sel]],
-                'first_beat_ms': round(float(pk[:-1][sel][0] - rec_start), 1) if sel.any() else None,
-                'hr_bpm': stats['hr_bpm'], 'mean_ibi_ms': stats['ibi_ms'], 'sdnn_ms': stats['sdnn_ms'],
-                'rmssd_ms': stats['rmssd_ms'], 'beats': stats['beats'], 'excluded': int((~valid).sum()),
-                'coverage': round(coverage, 3), 'quality': round(res['quality'], 3),
-            })
-            if coverage < 0.8:
-                result['warning'] = f'기록 구간의 {round((1 - coverage) * 100)}%에서 박동을 신뢰성 있게 검출하지 못했습니다.'
+        result = {'task_id': task_id, 'participant_id': pid, 'trial_ms': trial_ms, 'order': list(order),
+                  'blocks': {}, 'tx_ids': [], 'sent': []}
+        for b in blocks:
+            result['blocks'][b['cond']] = self._block_result(tp, r, g, b, offset)
         with self.lock:
             sess.results.append(result)
         return result
+
+    @staticmethod
+    def _block_result(tp, r, g, b, offset) -> dict:
+        rec_start, rec_end = b['rec_start'], b['rec_end']
+        out = {
+            'condition': b['cond'], 'order': b['order'],
+            'rec_start_utc': utc_iso(rec_start + offset), 'rec_duration_s': round((rec_end - rec_start) / 1000, 1),
+            'ibi_ms': [], 'valid': [], 'ibi_t_s': [], 'first_beat_ms': None,
+            'hr_bpm': None, 'mean_ibi_ms': None, 'sdnn_ms': None, 'rmssd_ms': None,
+            'beats': 0, 'excluded': 0, 'coverage': 0.0, 'quality': None, 'warning': '',
+        }
+        if b['trials'] is not None:
+            out['nback'] = score_nback(b['trials'], 1)
+            out['trials'] = b['trials']
+        mask = (tp >= rec_start - 20_000) & (tp <= b['end'] + 2000)   # 필터 안정화를 위해 앞부분 포함
+        res = analyze(tp[mask], r[mask], g[mask]) if mask.sum() > 1 else None
+        if res is None:
+            out['warning'] = '신호가 부족해 IBI를 계산하지 못했습니다.'
+            return out
+        pk = res['peak_ms']
+        sel = (pk[:-1] >= rec_start) & (pk[1:] <= rec_end)
+        ibi, valid = res['ibi_ms'][sel], res['valid'][sel]
+        stats = hrv_stats(ibi, valid)
+        coverage = float(ibi[valid].sum() / (rec_end - rec_start)) if len(ibi) else 0.0
+        out.update({
+            'ibi_ms': [round(float(v), 1) for v in ibi], 'valid': [bool(v) for v in valid],
+            'ibi_t_s': [round(float((e - rec_start) / 1000), 2) for e in pk[1:][sel]],
+            'first_beat_ms': round(float(pk[:-1][sel][0] - rec_start), 1) if sel.any() else None,
+            'hr_bpm': stats['hr_bpm'], 'mean_ibi_ms': stats['ibi_ms'], 'sdnn_ms': stats['sdnn_ms'],
+            'rmssd_ms': stats['rmssd_ms'], 'beats': stats['beats'], 'excluded': int((~valid).sum()),
+            'coverage': round(coverage, 3), 'quality': round(res['quality'], 3),
+        })
+        if coverage < 0.8:
+            out['warning'] = f'기록 구간의 {round((1 - coverage) * 100)}%에서 박동을 신뢰성 있게 검출하지 못했습니다.'
+        return out
 
     def get_result(self, pid: str, task_id: str) -> dict | None:
         with self.lock:
             sess = self.sessions.get(pid)
             return next((r for r in sess.results if r['task_id'] == task_id), None) if sess else None
 
-    def set_tx(self, pid: str, task_id: str, tx_ids: list[str]):
+    def set_tx(self, pid: str, task_id: str, tx_ids: list[str], sent: list[str]):
         with self.lock:
             for r in self.sessions[pid].results:
                 if r['task_id'] == task_id:
-                    r['tx_ids'] = list(tx_ids)
+                    r['tx_ids'], r['sent'] = list(tx_ids), list(sent)
 
     def session_list(self) -> list[dict]:
         now = now_ms()
@@ -508,27 +545,36 @@ def csv_bytes(header: list[str], rows) -> bytes:
     return ('﻿' + buf.getvalue()).encode('utf-8')
 
 
+def _blocks(results):
+    for r in results:
+        for cond in r['order']:
+            yield r, r['blocks'][cond]
+
+
 def csv_summary(results: list[dict]) -> bytes:
-    cols = ['participant_id', 'task_id', 'rec_start_utc', 'rec_duration_s', 'trial_ms', 'hr_bpm', 'mean_ibi_ms',
-            'sdnn_ms', 'rmssd_ms', 'beats', 'excluded', 'coverage', 'quality']
+    cols = ['rec_start_utc', 'rec_duration_s', 'hr_bpm', 'mean_ibi_ms', 'sdnn_ms', 'rmssd_ms',
+            'beats', 'excluded', 'coverage', 'quality']
     nb = ['hit', 'miss', 'false_alarm', 'correct_rejection', 'accuracy', 'd_prime', 'mean_rt_hit_ms']
-    return csv_bytes(cols + ['nback_' + k for k in nb] + ['tx_ids', 'warning'],
-                     ([r[c] for c in cols] + [r['nback'][k] for k in nb] + [' '.join(r['tx_ids']), r['warning']]
-                      for r in results))
+    return csv_bytes(['participant_id', 'task_id', 'condition', 'order', 'trial_ms'] + cols
+                     + ['nback_' + k for k in nb] + ['tx_count', 'warning'],
+                     ([r['participant_id'], r['task_id'], b['condition'], b['order'], r['trial_ms']]
+                      + [b[c] for c in cols] + [b['nback'][k] if 'nback' in b else '' for k in nb]
+                      + [len(r['tx_ids']), b['warning']] for r, b in _blocks(results)))
 
 
 def csv_ibi(results: list[dict]) -> bytes:
-    return csv_bytes(['participant_id', 'task_id', 'beat', 't_from_rec_start_s', 'ibi_ms', 'valid'],
-                     ([r['participant_id'], r['task_id'], i + 1, t, v, ok]
-                      for r in results for i, (t, v, ok) in enumerate(zip(r['ibi_t_s'], r['ibi_ms'], r['valid']))))
+    return csv_bytes(['participant_id', 'task_id', 'condition', 'order', 'beat', 't_from_rec_start_s', 'ibi_ms', 'valid'],
+                     ([r['participant_id'], r['task_id'], b['condition'], b['order'], i + 1, t, v, ok]
+                      for r, b in _blocks(results)
+                      for i, (t, v, ok) in enumerate(zip(b['ibi_t_s'], b['ibi_ms'], b['valid']))))
 
 
 def csv_trials(results: list[dict]) -> bytes:
     def phase(i):
         return 'pre' if i < N_PRE else 'rec' if i < N_PRE + N_REC else 'post'
-    return csv_bytes(['participant_id', 'task_id', 'trial', 'phase', 'stimulus', 'is_target', 'responded', 'rt_ms'],
-                     ([r['participant_id'], r['task_id'], i + 1, phase(i), t['s'], t.get('target'), t['r'], t['rt']]
-                      for r in results for i, t in enumerate(r['trials'])))
+    return csv_bytes(['participant_id', 'task_id', 'order', 'trial', 'phase', 'stimulus', 'is_target', 'responded', 'rt_ms'],
+                     ([r['participant_id'], r['task_id'], b['order'], i + 1, phase(i), t['s'], t.get('target'), t['r'], t['rt']]
+                      for r, b in _blocks(results) if 'trials' in b for i, t in enumerate(b['trials'])))
 
 
 def _code_version() -> str:
@@ -603,23 +649,10 @@ def tx_data_size(tx_data: dict) -> int:
     return len(json.dumps(tx_data, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
 
 
-def build_records(result: dict) -> list[dict]:
-    """IBI가 526바이트에 다 안 들어가면 여러 조각으로 나눈다. 첫 조각에 요약과 1-back 결과."""
-    nb = result['nback']
-    rt = nb['mean_rt_hit_ms']
-    base = {'schema': SCHEMA, 'mid': result['task_id'], 'pid': result['participant_id']}
-    head = {
-        't': result['rec_start_utc'][:19] + 'Z', 'hr': result['hr_bpm'], 'sdnn': result['sdnn_ms'],
-        'rmssd': result['rmssd_ms'],
-        'nb': [nb['hit'], nb['miss'], nb['false_alarm'], nb['correct_rejection'],
-               int(round(rt)) if rt is not None else None, result['trial_ms']],
-        'b0': int(round(result['first_beat_ms'])) if result['first_beat_ms'] is not None else None,
-    }
-    ibis = [int(round(v)) if ok else -int(round(v)) for v, ok in zip(result['ibi_ms'], result['valid'])]
-
+def _pack(base: dict, head: dict, ibis: list[int]) -> list[dict]:
+    """한 블록의 IBI를 526바이트 이하 조각들로 나눈다. 첫 조각에 요약(head)."""
     def fits(rec):
         return tx_data_size(build_tx_data(rec)) <= MAX_TX_DATA_BYTES
-
     parts, i = [], 0
     while True:
         rec = dict(base, p=len(parts) + 1, n=99, ibi=[], **(head if not parts else {}))
@@ -641,8 +674,31 @@ def build_records(result: dict) -> list[dict]:
     return parts
 
 
-def used_parts() -> set[tuple[str, int]]:
-    """체인과 mempool에 이미 있는 (측정 ID, 조각 번호)."""
+def build_records(result: dict) -> list[dict]:
+    """블록(휴식, 1-back)마다 기록을 만들고 진행 순서대로 이어 붙인다."""
+    parts = []
+    for cond in result['order']:
+        b = result['blocks'][cond]
+        base = {'schema': SCHEMA, 'mid': result['task_id'], 'pid': result['participant_id'],
+                'c': cond, 'o': b['order']}
+        head = {'t': b['rec_start_utc'][:19] + 'Z', 'hr': b['hr_bpm'], 'sdnn': b['sdnn_ms'],
+                'rmssd': b['rmssd_ms'],
+                'b0': int(round(b['first_beat_ms'])) if b['first_beat_ms'] is not None else None}
+        if 'nback' in b:
+            nb, rt = b['nback'], b['nback']['mean_rt_hit_ms']
+            head['nb'] = [nb['hit'], nb['miss'], nb['false_alarm'], nb['correct_rejection'],
+                          int(round(rt)) if rt is not None else None, result['trial_ms']]
+        ibis = [int(round(v)) if ok else -int(round(v)) for v, ok in zip(b['ibi_ms'], b['valid'])]
+        parts.extend(_pack(base, head, ibis))
+    return parts
+
+
+def part_key(rec: dict) -> str:
+    return f"{rec['c']}:{rec['p']}"
+
+
+def used_parts() -> set[tuple[str, str]]:
+    """체인과 mempool에 이미 있는 (측정 ID, "조건:조각 번호")."""
     if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
         raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
     if node_request('GET', '/status').get('is_synced') is not True:
@@ -665,30 +721,28 @@ def used_parts() -> set[tuple[str, int]]:
         try:
             c = json.loads(text)
             if isinstance(c, dict) and c.get('schema') == SCHEMA and isinstance(c.get('mid'), str) \
-                    and isinstance(c.get('p'), int):
-                used.add((c['mid'], c['p']))
+                    and isinstance(c.get('c'), str) and isinstance(c.get('p'), int):
+                used.add((c['mid'], f"{c['c']}:{c['p']}"))
         except (TypeError, ValueError):
             continue
     return used
 
 
 def save_to_blockchain(store: Store, result: dict) -> list[str]:
-    if result.get('hr_bpm') is None:
+    if all(b['hr_bpm'] is None for b in result['blocks'].values()):
         raise NodeError('IBI 결과가 없는 측정은 저장할 수 없습니다.')
     allowed = config('ALLOWED_PARTICIPANT_CODES')
     if allowed and result['participant_id'] not in {v.strip().upper() for v in allowed.split(',')}:
         raise NodeError('이 참가자 코드는 저장이 허용되지 않았습니다.')
     parts = build_records(result)
+    tx_ids, sent = list(result.get('tx_ids') or []), list(result.get('sent') or [])
+    if all(part_key(rec) in sent for rec in parts):
+        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
     key = service_signing_key()
     wallet, public = wallet_address(key)
-    tx_ids = list(result.get('tx_ids') or [])
-    if len(tx_ids) >= len(parts):
-        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
     with store.submit_lock:
-        used = used_parts()
-        # 이번 앱에서 이미 보낸 조각(아직 mempool에 안 보일 수 있음)도 건너뜀
-        used |= {(result['task_id'], p) for p in range(1, len(tx_ids) + 1)}
-        todo = [rec for rec in parts if (rec['mid'], rec['p']) not in used]
+        used = {k for mid, k in used_parts() if mid == result['task_id']} | set(sent)
+        todo = [rec for rec in parts if part_key(rec) not in used]   # 이미 보낸 조각은 건너뜀 (재시도 대비)
         if not todo:
             raise NodeError('이 측정은 이미 블록체인에 저장(또는 대기)되어 있습니다.')
         nonce = int(node_request('GET', f'/account/{wallet}/nonce')['next_nonce'])
@@ -706,9 +760,10 @@ def save_to_blockchain(store: Store, result: dict) -> list[str]:
                 'fee_xbit': tx['fee_xbit'], 'nonce': tx['nonce'], 'timestamp': tx['timestamp']})
             tx_id = str(res.get('tx_id', ''))
             if not TX_ID_RE.fullmatch(tx_id):
-                raise NodeError(f'{rec["p"]}번째 조각: 노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
+                raise NodeError(f'{COND_LABEL[rec["c"]]} {rec["p"]}번째 조각: 노드가 올바른 트랜잭션 ID를 반환하지 않았습니다.')
             tx_ids.append(tx_id)
-            store.set_tx(result['participant_id'], result['task_id'], tx_ids)
+            sent.append(part_key(rec))
+            store.set_tx(result['participant_id'], result['task_id'], tx_ids, sent)
     return tx_ids
 
 
@@ -733,7 +788,10 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
   canvas { width:100%; display:block; background:#12161b; border-radius:8px; }
   #err { color:#f87171; margin-top:10px; font-size:15px; text-align:center; }
   .hidden { display:none !important; }
-  #progress { color:#8a96a3; text-align:center; font-variant-numeric:tabular-nums; }
+  #blockTitle { text-align:center; font-size:15px; color:#cbd5e1; }
+  #progress { color:#8a96a3; text-align:center; font-variant-numeric:tabular-nums; font-size:14px; min-height:20px; }
+  #bar { height:4px; background:#1f2937; border-radius:2px; margin-top:6px; overflow:hidden; }
+  #barFill { height:100%; width:0; background:#3b82f6; transition:width .25s linear; }
   #stimBox { height:220px; display:flex; align-items:center; justify-content:center; }
   #stim { font-size:150px; font-weight:700; line-height:1; }
   #fix { font-size:40px; color:#6b7280; }
@@ -742,7 +800,8 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
   #matchBtn.pressed { background:#94a3b8; }
   table { width:100%; border-collapse:collapse; font-size:15px; margin-top:6px; }
   td { padding:6px 4px; border-bottom:1px solid #2a313a; }
-  td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  td:not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; }
+  th { font-weight:500; color:#8a96a3; text-align:right; padding:4px; font-size:13px; }
   .warn { color:#fbbf24; font-size:14px; margin-top:8px; }
   video { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
 </style></head>
@@ -760,11 +819,14 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
     <canvas id="cIbi" height="120"></canvas>
     <div class="hint">박동마다 빨간 점이 하나씩 찍히고 IBI 점이 고르게 이어지면 [측정 시작]을 누르세요.</div>
     <div class="hint" id="torchNote"></div>
+    <div class="hint">측정은 <b>휴식</b>과 <b>1-back</b> 두 블록으로 진행되며, 순서는 무작위입니다.</div>
     <button id="startBtn">측정 시작</button>
     <button id="cancelBtn" class="secondary">취소</button>
   </div>
 
   <div id="v-task" class="hidden">
+    <div id="blockTitle"></div>
+    <div id="bar"><div id="barFill"></div></div>
     <div id="progress"></div>
     <div id="stimBox"><span id="stim"></span><span id="fix" class="hidden">+</span></div>
     <div id="taskMsg"></div>
@@ -801,6 +863,9 @@ let stream = null, track = null, sampling = false, queue = [], runId = "", seq =
 let sendTimer = null, fallbackTimer = null, wakeLock = null, lastMediaTime = -1;
 let taskId = "", trialMs = 2500, nPre = 5, nRec = 10, nPost = 5, stimMs = 500;
 let digits = [], trials = [], cur = null, t0 = 0, timers = [], taskPayload = null, gotResult = false;
+let order = [], blocksOut = [], breakS = 5;
+const LABEL = { rest: "휴식", "1back": "1-back" };
+const COLOR = { rest: "#60a5fa", "1back": "#f59e0b" };
 
 const QMSG = {
   warming:   ["#4b5563", "신호 확인 중... 손가락을 그대로 두세요"],
@@ -914,22 +979,25 @@ function drawWave(c, wave) {
   g.fillStyle = "#ef4444";
   wave.pt.forEach((t, i) => { g.beginPath(); g.arc(X(t), Y(wave.py[i]), 4, 0, Math.PI * 2); g.fill(); });
 }
-function drawIbi(c, t, ms, valid, xmin, xmax) {
+function drawIbi(c, series, xmin, xmax) {
+  // series: [{t:[], ms:[], valid:[], color}]
   const [g, w, h] = fit(c);
   const pad = 34, lo = 400, hi = 1400;
   const X = v => pad + (w - pad - 6) * (v - xmin) / (xmax - xmin);
   const Y = v => h - 8 - (h - 16) * (Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo);
   g.strokeStyle = "#2a313a"; g.fillStyle = "#6b7280"; g.font = "10px system-ui";
   for (let v = 400; v <= 1400; v += 250) { g.beginPath(); g.moveTo(pad, Y(v)); g.lineTo(w, Y(v)); g.stroke(); g.fillText(v, 2, Y(v) + 3); }
-  if (!t || !t.length) return;
-  g.strokeStyle = "#22c55e"; g.lineWidth = 1.5; g.beginPath(); let on = false;
-  t.forEach((x, i) => { if (!valid[i]) { on = false; return; } on ? g.lineTo(X(x), Y(ms[i])) : g.moveTo(X(x), Y(ms[i])); on = true; });
-  g.stroke();
-  t.forEach((x, i) => { g.fillStyle = valid[i] ? "#22c55e" : "#9ca3af"; g.beginPath(); g.arc(X(x), Y(ms[i]), 3, 0, Math.PI * 2); g.fill(); });
+  for (const s of series || []) {
+    if (!s || !s.t || !s.t.length) continue;
+    g.strokeStyle = s.color; g.lineWidth = 1.5; g.beginPath(); let on = false;
+    s.t.forEach((x, i) => { if (!s.valid[i]) { on = false; return; } on ? g.lineTo(X(x), Y(s.ms[i])) : g.moveTo(X(x), Y(s.ms[i])); on = true; });
+    g.stroke();
+    s.t.forEach((x, i) => { g.fillStyle = s.valid[i] ? s.color : "#9ca3af"; g.beginPath(); g.arc(X(x), Y(s.ms[i]), 3, 0, Math.PI * 2); g.fill(); });
+  }
 }
 function drawPreview(p) {
   drawWave($("cWave"), p && p.wave);
-  drawIbi($("cIbi"), p && p.ibi.t, p && p.ibi.ms, p && p.ibi.valid, -60, 0);
+  drawIbi($("cIbi"), p ? [{ t: p.ibi.t, ms: p.ibi.ms, valid: p.ibi.valid, color: "#22c55e" }] : [], -60, 0);
   $("hrText").textContent = p && p.hr ? `· 현재 약 ${p.hr} bpm` : "";
 }
 
@@ -949,35 +1017,68 @@ function makeSequence(total, n, rate) {
 }
 function later(fn, ms) { timers.push(setTimeout(fn, Math.max(0, ms))); }
 
-function startTask() {
+function startSession() {
   trialMs = Math.round(args.trial_ms || 2500); nPre = args.n_pre || 5; nRec = args.n_rec || 10;
-  nPost = args.n_post || 5; stimMs = args.stim_ms || 500;
-  const total = nPre + nRec + nPost;
-  digits = makeSequence(total, 1, 0.3); trials = []; cur = null;
-  taskId = randomId(); gotResult = false; taskPayload = null;
+  nPost = args.n_post || 5; stimMs = args.stim_ms || 500; breakS = args.break_s || 5;
+  const r = new Uint8Array(1); crypto.getRandomValues(r);
+  order = (r[0] & 1) ? ["rest", "1back"] : ["1back", "rest"];      // 블록 순서 무작위
+  taskId = randomId(); gotResult = false; taskPayload = null; blocksOut = []; cur = null;
   showView("task");
+  runBlock(0);
+}
+
+function runBlock(bi) {
+  const cond = order[bi], total = nPre + nRec + nPost;
+  $("blockTitle").textContent = `블록 ${bi + 1} / ${order.length} · ${LABEL[cond]}`;
+  $("barFill").style.width = "0%";
   $("stim").textContent = ""; $("fix").classList.add("hidden"); $("progress").textContent = "";
+  $("matchBtn").classList.toggle("hidden", cond !== "1back");
   $("matchBtn").disabled = true;
-  let k = 3;
+  const guide = cond === "rest"
+    ? "<b>휴식</b><br>화면 가운데 + 를 편안히 바라보세요.<br>손가락은 그대로 두고 움직이지 마세요."
+    : "<b>1-back</b><br>숫자가 <b>바로 앞 숫자와 같으면</b> [일치]를 누르세요.";
+  let k = breakS;
   const tickDown = () => {
-    $("taskMsg").innerHTML = `숫자가 <b>바로 앞 숫자와 같으면</b> [일치]를 누르세요.<br><span style="font-size:42px">${k}</span>`;
-    if (k-- > 0) later(tickDown, 1000);
-    else {
-      $("taskMsg").textContent = ""; $("matchBtn").disabled = false; $("fix").classList.remove("hidden");
-      t0 = performance.now(); runTrial(0, total);
+    $("taskMsg").innerHTML = `${guide}<br><span style="font-size:42px">${k}</span>`;
+    setHeight();
+    if (k-- > 0) { later(tickDown, 1000); return; }
+    $("taskMsg").textContent = ""; $("fix").classList.remove("hidden");
+    t0 = performance.now();
+    const blk = { cond, start_tp: epoch(t0), rec_start_tp: epoch(t0 + nPre * trialMs),
+                  rec_end_tp: epoch(t0 + (nPre + nRec) * trialMs), end_tp: epoch(t0 + total * trialMs) };
+    blocksOut.push(blk);
+    if (cond === "1back") {
+      digits = makeSequence(total, 1, 0.3); trials = [];
+      $("matchBtn").disabled = false;
+      runTrial(0, total, bi);
+    } else {
+      runRest(0, total, bi);
     }
   };
   tickDown();
 }
-function runTrial(i, total) {
-  if (i >= total) return finishTask(total);
+
+function showProgress(i, total) {
+  $("barFill").style.width = `${Math.round(100 * (i + 1) / total)}%`;
+}
+
+function runRest(i, total, bi) {
+  if (i >= total) return blockDone(bi);
+  showProgress(i, total);
+  $("progress").textContent = `${Math.ceil((total - i) * trialMs / 1000)}초 남음`;
+  later(() => runRest(i + 1, total, bi), t0 + (i + 1) * trialMs - performance.now());
+}
+
+function runTrial(i, total, bi) {
+  if (i >= total) return blockDone(bi);
   const t = { s: digits[i], r: false, rt: null, on: null };
   trials.push(t); cur = t;
+  showProgress(i, total);
   $("progress").textContent = `${i + 1} / ${total}`;
   $("fix").classList.add("hidden"); $("stim").textContent = digits[i];
   t.on = performance.now();
   later(() => { $("stim").textContent = ""; $("fix").classList.remove("hidden"); }, stimMs);
-  later(() => runTrial(i + 1, total), t0 + (i + 1) * trialMs - performance.now());   // 누적 지연 없음
+  later(() => runTrial(i + 1, total, bi), t0 + (i + 1) * trialMs - performance.now());   // 누적 지연 없음
 }
 $("matchBtn").addEventListener("pointerdown", (e) => {
   e.preventDefault();
@@ -985,44 +1086,62 @@ $("matchBtn").addEventListener("pointerdown", (e) => {
   cur.r = true; cur.rt = Math.max(0, performance.now() - cur.on);
   const b = $("matchBtn"); b.classList.add("pressed"); later(() => b.classList.remove("pressed"), 150);
 });
-function finishTask(total) {
+
+function blockDone(bi) {
   cur = null;
+  const blk = blocksOut[bi];
+  if (blk.cond === "1back") blk.trials = trials.map(t => ({ s: t.s, r: t.r, rt: t.rt === null ? null : +t.rt.toFixed(1) }));
+  if (bi + 1 < order.length) { runBlock(bi + 1); return; }
+  finishSession();
+}
+
+function finishSession() {
   timers.forEach(clearTimeout); timers = [];
   stopCamera();
-  taskPayload = {
-    task_id: taskId, trial_ms: trialMs,
-    task_start_tp: epoch(t0), rec_start_tp: epoch(t0 + nPre * trialMs),
-    rec_end_tp: epoch(t0 + (nPre + nRec) * trialMs), task_end_tp: epoch(t0 + total * trialMs),
-    trials: trials.map(t => ({ s: t.s, r: t.r, rt: t.rt === null ? null : +t.rt.toFixed(1) })),
-  };
+  taskPayload = { task_id: taskId, trial_ms: trialMs, order: order.slice(), blocks: blocksOut };
   $("doneTitle").textContent = "결과 계산 중..."; $("summary").replaceChildren();
   $("warn").textContent = ""; $("saveHint").textContent = ""; $("resLabel").textContent = "";
   $("cRes").classList.add("hidden");
   showView("done");
   push();
 }
+
+function fmt(v, unit) { return v == null ? "-" : `${v}${unit || ""}`; }
 function renderResult(r) {
   $("doneTitle").textContent = "측정 완료";
-  const nb = r.nback, targets = nb.hit + nb.miss;
-  const rows = [
-    ["기록 구간", `${r.rec_duration_s}초 (숫자 ${nRec}개)`],
-    ["검출된 IBI", `${r.beats}개` + (r.excluded ? ` (제외 ${r.excluded}개)` : "")],
-    ["평균 심박", r.hr_bpm == null ? "-" : `${r.hr_bpm} bpm`],
-    ["평균 IBI", r.mean_ibi_ms == null ? "-" : `${r.mean_ibi_ms} ms`],
-    ["SDNN / RMSSD", `${r.sdnn_ms ?? "-"} / ${r.rmssd_ms ?? "-"} ms`],
-    ["1-back 정확도", `${Math.round(nb.accuracy * 100)}%`],
-    ["적중 / 오경보", `${nb.hit}/${targets} · ${nb.false_alarm}회`],
-    ["평균 반응시간", nb.mean_rt_hit_ms == null ? "-" : `${Math.round(nb.mean_rt_hit_ms)} ms`],
-  ];
+  const R = r.blocks.rest || {}, B = r.blocks["1back"] || {}, nb = B.nback || {};
   const table = document.createElement("table");
-  for (const [k, v] of rows) { const tr = table.insertRow(); tr.insertCell().textContent = k; tr.insertCell().textContent = v; }
-  $("summary").replaceChildren(table);
-  if (r.ibi_ms.length) {
-    $("resLabel").textContent = "기록 구간 IBI (회색 = 제외된 박동)";
-    $("cRes").classList.remove("hidden");
-    drawIbi($("cRes"), r.ibi_t_s, r.ibi_ms, r.valid, 0, r.rec_duration_s);
+  const head = table.createTHead().insertRow();
+  for (const h of ["", "휴식", "1-back"]) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
+  const rows = [
+    ["진행 순서", r.order.map(c => LABEL[c]).join(" → "), ""],
+    ["검출된 IBI", fmt(R.beats, "개"), fmt(B.beats, "개")],
+    ["평균 심박", fmt(R.hr_bpm, " bpm"), fmt(B.hr_bpm, " bpm")],
+    ["평균 IBI", fmt(R.mean_ibi_ms, " ms"), fmt(B.mean_ibi_ms, " ms")],
+    ["SDNN", fmt(R.sdnn_ms, " ms"), fmt(B.sdnn_ms, " ms")],
+    ["RMSSD", fmt(R.rmssd_ms, " ms"), fmt(B.rmssd_ms, " ms")],
+    ["1-back 정확도", "", nb.accuracy == null ? "-" : `${Math.round(nb.accuracy * 100)}%`],
+    ["적중 / 오경보", "", nb.hit == null ? "-" : `${nb.hit}/${nb.hit + nb.miss} · ${nb.false_alarm}회`],
+    ["평균 반응시간", "", nb.mean_rt_hit_ms == null ? "-" : `${Math.round(nb.mean_rt_hit_ms)} ms`],
+  ];
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    if (row[0] === "진행 순서") { tr.insertCell().textContent = row[0]; const td = tr.insertCell(); td.colSpan = 2; td.textContent = row[1]; continue; }
+    row.forEach(v => { tr.insertCell().textContent = v; });
   }
-  $("warn").textContent = r.warning || "";
+  $("summary").replaceChildren(table);
+  const series = r.order.map(c => {
+    const b = r.blocks[c];
+    return { t: b.ibi_t_s, ms: b.ibi_ms, valid: b.valid, color: COLOR[c] };
+  });
+  if (series.some(s => s.t.length)) {
+    $("resLabel").textContent = "기록 구간 IBI — 파랑: 휴식, 주황: 1-back (회색 = 제외된 박동)";
+    $("cRes").classList.remove("hidden");
+    const dur = Math.max(R.rec_duration_s || 0, B.rec_duration_s || 0) || 25;
+    drawIbi($("cRes"), series, 0, dur);
+  }
+  $("warn").textContent = r.order.map(c => r.blocks[c].warning ? `${LABEL[c]}: ${r.blocks[c].warning}` : "").filter(Boolean).join(" ");
   setHeight();
 }
 
@@ -1045,7 +1164,7 @@ $("prepBtn").addEventListener("click", async () => {
     $("err").textContent = e && e.name === "NotAllowedError" ? "카메라 권한을 허용해 주세요." : (e.message || String(e));
   } finally { $("prepBtn").disabled = false; }
 });
-$("startBtn").addEventListener("click", startTask);
+$("startBtn").addEventListener("click", startSession);
 $("cancelBtn").addEventListener("click", () => { setValue({ run_id: runId, seq: ++seq, sent_at: epoch(performance.now()), mode: "idle", running: false, samples: [], task: null }); reset(); });
 $("againBtn").addEventListener("click", reset);
 document.addEventListener("visibilitychange", () => {
@@ -1076,6 +1195,14 @@ def ppg_component():
     return _component_for(CODE_VERSION)
 
 
+def public_result(result: dict) -> dict:
+    """컴포넌트로 보낼 결과 (1-back 시행 목록과 저장 상태는 제외)."""
+    return {
+        'task_id': result['task_id'], 'order': result['order'], 'trial_ms': result['trial_ms'],
+        'blocks': {c: {k: v for k, v in b.items() if k != 'trials'} for c, b in result['blocks'].items()},
+    }
+
+
 def make_preview(live: dict | None) -> dict | None:
     """측정 준비 화면용: 최근 10초 파형 + 박동, 최근 60초 IBI."""
     if not live or live['res'] is None:
@@ -1100,12 +1227,13 @@ def make_preview(live: dict | None) -> dict | None:
 # 5. 화면
 # ============================================================
 def phone_page():
-    st.markdown("### 📷 PPG + 1-back 측정")
+    st.markdown("### 📷 PPG 측정 (휴식 / 1-back)")
     pid_raw = st.text_input("참가자 코드", placeholder="P01", max_chars=4)
     with st.expander("설정"):
         trial_s = st.number_input("숫자 간격 (초)", 1.0, 6.0, DEFAULT_TRIAL_MS / 1000, 0.5,
-                                  help=f"IBI 기록 구간 = 숫자 {N_REC}개 × 간격")
-        st.caption(f"전체 {N_TOTAL}개 숫자 · IBI 기록 구간 {N_REC * trial_s:.0f}초 · 총 약 {N_TOTAL * trial_s + 3:.0f}초")
+                                  help=f"블록마다 IBI 기록 구간 = {N_REC}칸 × 간격 (휴식 블록도 같은 길이)")
+        st.caption(f"블록당 {N_TOTAL}칸 ({N_TOTAL * trial_s:.0f}초), IBI 기록 {N_REC * trial_s:.0f}초 · "
+                   f"휴식 + 1-back 2개 블록, 순서 무작위 · 총 약 {2 * (N_TOTAL * trial_s + BREAK_S):.0f}초")
     if not pid_raw:
         st.caption("실험자가 알려준 참가자 코드를 입력하세요.")
         return
@@ -1127,7 +1255,7 @@ def phone_panel(pid: str, trial_ms: int):
         run_id=state.get('run_id', ''), ack=state.get('ack', 0.0), quality=state.get('quality', 'warming'),
         error=state.get('error', ''), preview=state.get('preview'), result=state.get('result_public'),
         result_error=state.get('result_error'), saved=state.get('saved'),
-        trial_ms=trial_ms, n_pre=N_PRE, n_rec=N_REC, n_post=N_POST, stim_ms=STIM_MS,
+        trial_ms=trial_ms, n_pre=N_PRE, n_rec=N_REC, n_post=N_POST, stim_ms=STIM_MS, break_s=BREAK_S,
         key=f'ppg_{pid}', default=None)
 
     if isinstance(value, dict) and (value.get('run_id'), value.get('seq')) != state.get('last'):
@@ -1150,7 +1278,7 @@ def phone_panel(pid: str, trial_ms: int):
                 try:
                     result = store.compute_result(pid, state['run_id'], task, time.time() - state['task_first_seen'])
                     if result is not None:
-                        state['result_public'] = {k: v for k, v in result.items() if k != 'trials'}
+                        state['result_public'] = public_result(result)
                 except ValueError as exc:
                     state['result_error'] = {'task_id': tid, 'text': str(exc)}
 
@@ -1162,19 +1290,24 @@ def phone_panel(pid: str, trial_ms: int):
     if result is None:
         return
     st.divider()
-    if result['tx_ids']:
+    try:
+        n_parts = len(build_records(result))
+    except NodeError as exc:
+        st.error(str(exc))
+        return
+    n_sent = len(result['sent'])
+    if result['tx_ids'] and n_sent >= n_parts:
         st.success(f"블록체인 저장 요청 완료 ({len(result['tx_ids'])}개 트랜잭션)")
         for t in result['tx_ids']:
             st.code(t, language=None)
-    elif result['hr_bpm'] is None:
+    elif all(b['hr_bpm'] is None for b in result['blocks'].values()):
         st.warning("IBI 결과가 없어 저장할 수 없습니다. 다시 측정하세요.")
     else:
-        try:
-            n_parts = len(build_records(result))
-        except NodeError:
-            n_parts = None
-        st.caption(f"IBI {len(result['ibi_ms'])}개 + 1-back 결과를 기록합니다"
-                   + (f" (트랜잭션 {n_parts}개)" if n_parts else "") + ". 공개 블록체인 기록은 삭제할 수 없습니다.")
+        if n_sent:
+            st.warning(f"{n_parts}개 조각 중 {n_sent}개만 저장되었습니다. [블록체인 저장]을 다시 누르면 남은 조각만 보냅니다.")
+        n_ibi = sum(len(b['ibi_ms']) for b in result['blocks'].values())
+        st.caption(f"휴식·1-back IBI {n_ibi}개 + 1-back 결과를 기록합니다 (트랜잭션 {n_parts}개). "
+                   "공개 블록체인 기록은 삭제할 수 없습니다.")
         if st.button("🔗 블록체인 저장", type="primary", key=f"save_{result['task_id']}"):
             try:
                 with st.spinner("서명 및 전송 중..."):
@@ -1231,15 +1364,19 @@ def monitor_page():
         st.caption("완료된 측정이 없습니다.")
         return
     import pandas as pd
-    rows = [{'참가자': r['participant_id'], '기록 시작(UTC)': r['rec_start_utc'][11:19], 'HR': r['hr_bpm'],
-             'IBI': r['mean_ibi_ms'], 'SDNN': r['sdnn_ms'], 'RMSSD': r['rmssd_ms'], '박동': r['beats'],
-             '커버리지': r['coverage'], '1-back 정확도': r['nback']['accuracy'], "d'": r['nback']['d_prime'],
-             'RT': r['nback']['mean_rt_hit_ms'], '저장 tx': len(r['tx_ids']), '경고': r['warning']} for r in results]
+    rows = [{'참가자': r['participant_id'], '측정': r['task_id'][:8], '조건': COND_LABEL[b['condition']],
+             '순서': b['order'], '기록 시작(UTC)': b['rec_start_utc'][11:19], 'HR': b['hr_bpm'],
+             'IBI': b['mean_ibi_ms'], 'SDNN': b['sdnn_ms'], 'RMSSD': b['rmssd_ms'], '박동': b['beats'],
+             '커버리지': b['coverage'],
+             '1-back 정확도': b['nback']['accuracy'] if 'nback' in b else None,
+             "d'": b['nback']['d_prime'] if 'nback' in b else None,
+             'RT': b['nback']['mean_rt_hit_ms'] if 'nback' in b else None,
+             '저장 tx': len(r['tx_ids']), '경고': b['warning']} for r, b in _blocks(results)]
     st.dataframe(pd.DataFrame(rows), hide_index=True)
     c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("요약 CSV", csv_summary(results), "ppg_1back_summary.csv", "text/csv")
-    c2.download_button("IBI CSV", csv_ibi(results), "ppg_1back_ibi.csv", "text/csv")
-    c3.download_button("1-back CSV", csv_trials(results), "ppg_1back_trials.csv", "text/csv")
+    c1.download_button("블록 요약 CSV", csv_summary(results), "ppg_rest_1back_summary.csv", "text/csv")
+    c2.download_button("IBI CSV", csv_ibi(results), "ppg_rest_1back_ibi.csv", "text/csv")
+    c3.download_button("1-back CSV", csv_trials(results), "ppg_rest_1back_trials.csv", "text/csv")
     if sessions:
         c4.download_button("선택 참가자 원시 신호", store.csv_raw(pid), f"{pid}_raw.csv", "text/csv")
 
