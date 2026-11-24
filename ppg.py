@@ -531,9 +531,26 @@ def csv_trials(results: list[dict]) -> bytes:
                       for r in results for i, t in enumerate(r['trials'])))
 
 
-@st.cache_resource
-def get_store() -> Store:
+def _code_version() -> str:
+    """이 파일 내용의 해시. 코드가 바뀌면 캐시된 저장소/컴포넌트를 새로 만든다.
+    (st.cache_resource는 함수 본문만 보고 캐시를 유지하므로, 클래스가 바뀌어도
+     예전 버전 객체가 남아 TypeError 등이 날 수 있다.)"""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except (NameError, OSError):
+        return SCHEMA
+
+
+CODE_VERSION = _code_version()
+
+
+@st.cache_resource(max_entries=1)
+def _store_for(version: str) -> Store:
     return Store()
+
+
+def get_store() -> Store:
+    return _store_for(CODE_VERSION)
 
 
 # ============================================================
@@ -665,8 +682,12 @@ def save_to_blockchain(store: Store, result: dict) -> list[str]:
     key = service_signing_key()
     wallet, public = wallet_address(key)
     tx_ids = list(result.get('tx_ids') or [])
+    if len(tx_ids) >= len(parts):
+        raise NodeError('이 측정은 이미 블록체인에 저장 요청되었습니다.')
     with store.submit_lock:
         used = used_parts()
+        # 이번 앱에서 이미 보낸 조각(아직 mempool에 안 보일 수 있음)도 건너뜀
+        used |= {(result['task_id'], p) for p in range(1, len(tx_ids) + 1)}
         todo = [rec for rec in parts if (rec['mid'], rec['p']) not in used]
         if not todo:
             raise NodeError('이 측정은 이미 블록체인에 저장(또는 대기)되어 있습니다.')
@@ -872,8 +893,14 @@ function push() {
 
 // ---- 그래프 ----
 function fit(c) {
-  const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = +c.getAttribute("height");
-  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  // 화면 높이(CSS px)는 처음 지정한 height 속성값으로 고정한다.
+  // c.height(실제 픽셀 수)를 바꾸면 height 속성도 함께 바뀌므로, 매번 속성에서 다시 읽으면
+  // 고해상도 화면(dpr 2~3)에서 높이가 커져 그래프 아래쪽이 잘린다.
+  if (!c.dataset.h) c.dataset.h = c.getAttribute("height");
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = +c.dataset.h;
+  c.style.height = h + "px";
+  const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+  if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
   const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
   return [g, w, h];
 }
@@ -1032,16 +1059,21 @@ setHeight();
 """
 
 
-@st.cache_resource
-def ppg_component():
-    """HTML을 임시 폴더에 써서 양방향 컴포넌트로 등록 (빌드 도구 불필요)."""
+@st.cache_resource(max_entries=1)
+def _component_for(version: str):
+    """HTML을 임시 폴더에 써서 양방향 컴포넌트로 등록 (빌드 도구 불필요).
+    버전별 폴더를 써서 코드가 바뀌면 브라우저도 새 HTML을 받는다."""
     import streamlit.components.v1 as components
-    folder = Path(tempfile.gettempdir()) / 'ppg_1back_component'
+    folder = Path(tempfile.gettempdir()) / f'ppg_1back_component_{version}'
     folder.mkdir(exist_ok=True)
     index = folder / 'index.html'
     if not index.exists() or index.read_text(encoding='utf-8') != COMPONENT_HTML:
         index.write_text(COMPONENT_HTML, encoding='utf-8')
     return components.declare_component('ppg_1back', path=str(folder))
+
+
+def ppg_component():
+    return _component_for(CODE_VERSION)
 
 
 def make_preview(live: dict | None) -> dict | None:
