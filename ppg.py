@@ -1923,9 +1923,7 @@ def main():
                       label_visibility="collapsed", key='view')
     if view_i == 1:
         chain_page()
-        return
-    st.caption(tr(f"Switching to [{chain_name()}] during a measurement stops it.",
-                  f"측정 중에 [{chain_name()}]로 바꾸면 진행 중인 측정이 중단됩니다."))
+        return    
     phone_page()
 
 
