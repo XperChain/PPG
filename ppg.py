@@ -16,7 +16,7 @@
                   1-back 블록: 숫자가 바로 앞 숫자와 같으면 [일치]
                   블록 사이에 안내 + 5초 카운트다운
   3) [블록체인 저장]  두 블록의 IBI + 1-back 결과를 트랜잭션 1개로 XperChain LogBook에 기록
-  상단 [블록체인 보기]  컨트랙트의 모든 기록을 표로 보여 주고 엑셀(.xlsx)로 내려받기
+  상단 [데이터 보기]  컨트랙트의 모든 기록을 표로 보여 주고 엑셀(.xlsx)로 내려받기
 
 블록체인 기록 형식 (schema = prb3, 노드의 526바이트 제한 안에 두 블록을 담도록 압축)
   {"schema":"prb3","mid":측정ID,"pid":"P01","ms":숫자간격 ms,"o":"rb"(진행 순서: r=휴식, b=1-back),
@@ -25,7 +25,7 @@
    "b":{ ...휴식과 같음..., "nb":[적중,놓침,오경보,정기각,적중 평균 RT ms]}}
   ibi 압축: 정수 ms IBI를 첫 값은 varint(ibi), 다음부터 varint(zigzag(차이))로 바이트열을 만든 뒤
             Base85(Python base64.b85encode). 앱의 decode_ibis()로 풀 수 있고,
-            [블록체인 보기] 엑셀에는 풀린 값이 들어갑니다. x는 이상치로 제외된 박동의 0부터 센 번호.
+            [데이터 보기] 엑셀에는 풀린 값이 들어갑니다. x는 이상치로 제외된 박동의 0부터 센 번호.
   심박/SDNN/RMSSD는 IBI에서 다시 계산할 수 있어 저장하지 않습니다.
 
 설정 (.streamlit/secrets.toml 또는 환경변수)
@@ -93,13 +93,14 @@ MAX_TX_DATA_BYTES = 526
 N_PRE, N_REC, N_POST = 5, 10, 5
 N_TOTAL = N_PRE + N_REC + N_POST
 STIM_MS = 500                      # 숫자 제시 시간
-DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (블록당 기록 구간 = 10 × 2.5초 = 25초)
+DEFAULT_TRIAL_MS = 2500            # 숫자 간격 (블록당 기록 구간 = 10 × 2.5초 = 25초). 화면 설정 없이 고정.
+                                   # 바꾸려면 이 값을 수정 (트랜잭션 526바이트 제한 때문에 최대 4000 권장)
 BREAK_S = 5                        # 블록 시작 전 안내 + 카운트다운
 
 # 화면 상단 메뉴 아이콘/이름. 아이콘은 이모지 또는 Streamlit 머티리얼 아이콘(:material/이름:)
 #   다른 후보: ':material/ecg_heart:', ':material/cardiology:', '🫀', '💓'
 MEASURE_ICON, MEASURE_NAME = ':material/monitor_heart:', '심박 측정'
-CHAIN_ICON, CHAIN_NAME = '⛓️', '블록체인 보기'
+CHAIN_ICON, CHAIN_NAME = '⛓️', '데이터 보기'
 
 FS = 30.0
 GAP_MS = 400.0
@@ -783,7 +784,7 @@ def save_to_blockchain(store: Store, result: dict) -> str:
     size = tx_data_size(tx_data)
     if size > MAX_TX_DATA_BYTES:
         raise NodeError(f'기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘습니다. '
-                        '설정에서 숫자 간격을 줄여 다시 측정하세요.')
+                        '다시 측정하세요.')
     key = service_signing_key()
     wallet, public = wallet_address(key)
     with store.submit_lock:
@@ -807,7 +808,7 @@ def save_to_blockchain(store: Store, result: dict) -> str:
     return tx_id
 
 
-# ---- 블록체인 보기: 컨트랙트 전체 기록 읽기 / 해석 / 엑셀 ----
+# ---- 데이터 보기: 컨트랙트 전체 기록 읽기 / 해석 / 엑셀 ----
 def fetch_contract_items() -> list[dict]:
     if not ADDRESS_RE.fullmatch(CONTRACT_ADDR):
         raise NodeError('XPER_CONTRACT_ADDRESS 설정이 올바르지 않습니다.')
@@ -989,7 +990,7 @@ COMPONENT_HTML = r"""<!DOCTYPE html>
 </style></head>
 <body><div class="wrap">
   <div id="v-idle">
-    <div class="hint">휴대폰을 책상이나 받침대에 올려 두고,<br>왼손 검지로 <b>후면 카메라와 플래시를 함께</b> 가볍게 덮어 주세요.<br>너무 세게 누르면 신호가 약해집니다.</div>
+    <div class="hint">왼손으로 스마트폰을 잡고 왼손 검지로 <b>후면 카메라를</b> 가볍게 덮어 주세요.</div>
     <button id="prepBtn">측정 준비</button>
   </div>
 
@@ -1050,7 +1051,7 @@ const LABEL = { rest: "휴식", "1back": "1-back" };
 const COLOR = { rest: "#60a5fa", "1back": "#f59e0b" };
 
 const QMSG = {
-  warming:   ["#4b5563", "신호 확인 중... 손가락을 그대로 두세요"],
+  warming:   ["#4b5563", "신호 확인 중... 검지 손가락을 카메라와 접촉을 유지해주세요"],
   good:      ["#22c55e", "신호 좋음"],
   fair:      ["#eab308", "신호 보통 — 손가락을 움직이지 마세요"],
   poor:      ["#ef4444", "신호 약함 — 손가락을 가볍게 다시 올려 주세요"],
@@ -1415,7 +1416,7 @@ def _load_chain(version: str, nonce: int):
 
 
 def chain_page():
-    st.markdown(f"### {CHAIN_ICON} 블록체인 기록")
+    st.markdown(f"### {CHAIN_ICON} {CHAIN_NAME}")
     st.caption(f"컨트랙트 `{CONTRACT_ADDR}` · 노드 `{NODE_URL}`")
     if st.button("🔄 새로 불러오기"):
         st.session_state['chain_nonce'] = st.session_state.get('chain_nonce', 0) + 1
@@ -1473,13 +1474,8 @@ def chain_page():
 
 
 def phone_page():
-    st.markdown(f"### {MEASURE_ICON} {MEASURE_NAME} (휴식 / 1-back)")
+    st.markdown(f"### {MEASURE_ICON} {MEASURE_NAME}")
     pid_raw = st.text_input("참가자 코드", placeholder="P01", max_chars=4)
-    with st.expander("설정"):
-        trial_s = st.number_input("숫자 간격 (초)", 1.0, 4.0, DEFAULT_TRIAL_MS / 1000, 0.5,
-                                  help=f"블록마다 IBI 기록 구간 = {N_REC}칸 × 간격 (휴식 블록도 같은 길이). 두 블록을 트랜잭션 1개(526바이트)에 담기 위해 최대 4초.")
-        st.caption(f"블록당 {N_TOTAL}칸 ({N_TOTAL * trial_s:.0f}초), IBI 기록 {N_REC * trial_s:.0f}초 · "
-                   f"휴식 + 1-back 2개 블록, 순서 무작위 · 총 약 {2 * (N_TOTAL * trial_s + BREAK_S):.0f}초")
     if not pid_raw:
         st.caption("실험자가 알려준 참가자 코드를 입력하세요.")
         return
@@ -1488,7 +1484,7 @@ def phone_page():
     except ValueError as exc:
         st.error(str(exc))
         return
-    phone_panel(pid, int(trial_s * 1000))
+    phone_panel(pid, DEFAULT_TRIAL_MS)
 
 
 @st.fragment
@@ -1540,12 +1536,12 @@ def phone_panel(pid: str, trial_ms: int):
     if result['tx_id']:
         st.success("블록체인 저장 요청 완료 (트랜잭션 1개)")
         st.code(result['tx_id'], language=None)
-        st.caption("상단의 [블록체인 보기]에서 기록을 확인할 수 있습니다. 블록이 만들어진 뒤에 나타납니다.")
+        st.caption(f"상단의 [{CHAIN_NAME}]에서 기록을 확인할 수 있습니다. 블록이 만들어진 뒤에 나타납니다.")
     elif all(b['hr_bpm'] is None for b in result['blocks'].values()):
         st.warning("IBI 결과가 없어 저장할 수 없습니다. 다시 측정하세요.")
     elif size > MAX_TX_DATA_BYTES:
         st.error(f"기록 크기 {size}바이트가 노드 제한 {MAX_TX_DATA_BYTES}바이트를 넘어 트랜잭션 하나에 담을 수 없습니다. "
-                 "설정에서 숫자 간격을 줄여 다시 측정하세요.")
+                 "다시 측정하세요.")
     else:
         n_ibi = sum(len(b['ibi_ms']) for b in result['blocks'].values())
         st.caption(f"휴식·1-back IBI {n_ibi}개 + 1-back 결과를 트랜잭션 1개로 기록합니다 "
@@ -1658,7 +1654,7 @@ def main():
         return
     views = [f"{MEASURE_ICON} {MEASURE_NAME}", f"{CHAIN_ICON} {CHAIN_NAME}"]
     view = st.radio("화면", views, horizontal=True, label_visibility="collapsed",
-                    help="측정 중에 [블록체인 보기]로 바꾸면 진행 중인 측정이 중단됩니다.")
+                    help=f"측정 중에 [{CHAIN_NAME}]로 바꾸면 진행 중인 측정이 중단됩니다.")
     if view == views[1]:
         chain_page()
     else:
